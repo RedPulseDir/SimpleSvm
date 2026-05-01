@@ -20,10 +20,12 @@ jobs:
       - name: Build Driver
         run: |
           mkdir build\output build\obj
-          ml64.exe /c /Fo build\obj\x64.obj x64.asm
-          cl.exe /nologo /O2 /GS- /c /D_AMD64_ /D_WIN64 /Fo build\obj\SimpleSvm.obj SimpleSvm.cpp
-          link.exe /nologo /out:build\output\SimpleSvm.sys /driver /entry:DriverEntry /subsystem:native build\obj\*.obj ntoskrnl.lib hal.lib
+          cd SimpleSvm
+          ml64.exe /c /Fo..\build\obj\x64.obj x64.asm
+          cl.exe /nologo /O2 /GS- /c /D_AMD64_ /D_WIN64 /Fo..\build\obj\SimpleSvm.obj SimpleSvm.cpp
+          link.exe /nologo /out:..\build\output\SimpleSvm.sys /driver /entry:DriverEntry /subsystem:native ..\build\obj\*.obj
         shell: cmd
+        working-directory: ${{ github.workspace }}
         
       - name: Upload
         uses: actions/upload-artifact@v4
