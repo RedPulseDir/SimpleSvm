@@ -1,33 +1,66 @@
 #pragma once
-#include "global.h"
-#include "amd.h"
 
-// MSR permissions map size
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <ntifs.h>
+#include <intrin.h>
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+#define KERNEL_STACK_SIZE           (PAGE_SIZE * 8)
 #define SVM_MSR_PERMISSIONS_MAP_SIZE (PAGE_SIZE * 2)
 
-// SVM MSRs
-#define SVM_MSR_VM_CR       0xC0010114
-#define SVM_MSR_VM_HSAVE_PA 0xC0010117
-#define SVM_VM_CR_SVMDIS    (1UL << 4)
+#define SVM_MSR_VM_CR               0xC0010114
+#define SVM_MSR_VM_HSAVE_PA         0xC0010117
+#define IA32_MSR_EFER               0xC0000080
+#define IA32_MSR_LSTAR              0xC0000082
+#define IA32_MSR_DEBUGCTL           0x000001D9
+#define IA32_MSR_PAT                0x00000277
+
+#define EFER_SVME                   (1ULL << 12)
+#define EFER_LME                    (1ULL << 8)
+#define EFER_LMA                    (1ULL << 10)
+#define EFER_NXE                    (1ULL << 11)
+
+#define SVM_VM_CR_SVMDIS            (1UL << 4)
 
 // Intercept bits
-#define SVM_INTERCEPT_MISC1_CPUID    (1UL << 18)
+#define SVM_INTERCEPT_MISC1_CPUID   (1UL << 18)
 #define SVM_INTERCEPT_MISC1_MSR_PROT (1UL << 28)
-#define SVM_INTERCEPT_MISC2_VMRUN    (1UL << 0)
-#define SVM_NP_ENABLE_NP_ENABLE      (1UL << 0)
+#define SVM_INTERCEPT_MISC2_VMRUN   (1UL << 0)
+#define SVM_INTERCEPT_MISC1_GDTR_READ (1UL << 7)
+#define SVM_INTERCEPT_MISC1_RDTSC   (1UL << 14)
+#define SVM_INTERCEPT_MISC1_RDPMC   (1UL << 15)
+#define SVM_INTERCEPT_MISC2_VMMCALL (1UL << 1)
+
+#define SVM_INTERCEPT_EXCEPTION_DB  (1UL << 1)
+#define SVM_INTERCEPT_EXCEPTION_PF  (1UL << 14)
+#define SVM_INTERCEPT_EXCEPTION_AC  (1UL << 17)
+#define SVM_INTERCEPT_EXCEPTION_SS  (1UL << 12)
 
 // VMEXIT codes
-#define VMEXIT_CPUID        0x0072
-#define VMEXIT_MSR          0x007C
-#define VMEXIT_VMRUN        0x0080
-#define VMEXIT_GDTR_READ    0x0067
-#define VMEXIT_EXCEPTION_DB 0x0041
-#define VMEXIT_EXCEPTION_PF 0x004E
-#define VMEXIT_EXCEPTION_AC 0x0051
-#define VMEXIT_EXCEPTION_SS 0x004C
-#define VMEXIT_NPF          0x0400
+#define VMEXIT_CPUID                0x0072
+#define VMEXIT_MSR                  0x007C
+#define VMEXIT_VMRUN                0x0080
+#define VMEXIT_GDTR_READ            0x0067
+#define VMEXIT_EXCEPTION_DB         0x0041
+#define VMEXIT_EXCEPTION_PF         0x004E
+#define VMEXIT_EXCEPTION_AC         0x0051
+#define VMEXIT_EXCEPTION_SS         0x004C
 
-// VMCB structures
+// CPUID leaves
+#define CPUID_HV_VENDOR_AND_MAX_FUNCTIONS  0x40000000
+#define CPUID_HV_INTERFACE                 0x40000001
+#define CPUID_UNLOAD_SIMPLE_SVM            0x41414141
+
+// ============================================================================
+// Structures
+// ============================================================================
+
 #pragma pack(push, 1)
 
 typedef struct _EVENTINJ {
@@ -166,18 +199,58 @@ typedef struct _VMCB {
     UINT8 Reserved[0x1000 - sizeof(VMCB_CONTROL_AREA) - sizeof(VMCB_STATE_SAVE_AREA)];
 } VMCB, *PVMCB;
 
+typedef struct _DESCRIPTOR_TABLE_REGISTER {
+    UINT16 Limit;
+    UINT64 Base;
+} DESCRIPTOR_TABLE_REGISTER;
+
+typedef struct _SEGMENT_ATTRIBUTE {
+    union {
+        UINT16 Value;
+        struct {
+            UINT16 Type : 4;
+            UINT16 System : 1;
+            UINT16 Dpl : 2;
+            UINT16 Present : 1;
+            UINT16 Avl : 1;
+            UINT16 LongMode : 1;
+            UINT16 DefaultBit : 1;
+            UINT16 Granularity : 1;
+            UINT16 Reserved : 4;
+        } Bits;
+    };
+} SEGMENT_ATTRIBUTE;
+
+typedef struct _GUEST_REGISTERS {
+    UINT64 R15, R14, R13, R12, R11, R10, R9, R8;
+    UINT64 Rdi, Rsi, Rbp, Rsp, Rbx, Rdx, Rcx, Rax;
+} GUEST_REGISTERS, *PGUEST_REGISTERS;
+
 #pragma pack(pop)
 
-static_assert(sizeof(VMCB_CONTROL_AREA) == 0x400, "VMCB_CONTROL_AREA size mismatch");
-static_assert(sizeof(VMCB_STATE_SAVE_AREA) == 0x298, "VMCB_STATE_SAVE_AREA size mismatch");
-static_assert(sizeof(VMCB) == 0x1000, "VMCB size mismatch");
+// ============================================================================
+// Assembly functions
+// ============================================================================
 
-// Function declarations
-extern "C" {
-    VOID LaunchVm(PVOID HostRsp);
-    BOOLEAN HandleVmExit(PVOID VpData, PVOID GuestRegisters);
-    VOID SystemCallHook(VOID);
-    UINT64 ReadDr(UINT32 Dr);
-    VOID WriteDr(UINT32 Dr, UINT64 Value);
-    VOID InvalidatePage(PVOID Address);
+VOID LaunchVm(PVOID GuestVmcbPa);
+VOID SyscallHook(VOID);
+VOID InvalidatePage(PVOID Address);
+
+// ============================================================================
+// C handlers
+// ============================================================================
+
+BOOLEAN NTAPI SvHandleVmExit(PVOID VpData, PVOID GuestRegisters);
+NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath);
+
+// ============================================================================
+// Global variables (exported to asm)
+// ============================================================================
+
+extern UINT64 OriginalLstar;
+extern UINT64 SyscallHandler;
+extern UINT64 TargetDR3;
+
+#ifdef __cplusplus
 }
+#endif
