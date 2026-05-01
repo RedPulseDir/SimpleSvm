@@ -1,305 +1,116 @@
 /*!
-@file       SimpleSvm.cpp
-@brief      Full refactored SVM hypervisor with proper synchronization
-@author     Fox (based on Satoshi Tanda's work)
-*/
-
-#define POOL_NX_OPTIN 1
-
+    @file       SimpleSvm.cpp
+    @brief      All C code.
+ */
+#define POOL_NX_OPTIN   1
 #include "SimpleSvm.hpp"
-#include "process_manager.h"
-#include "pte.h"
 
 #include <intrin.h>
 #include <ntifs.h>
 #include <stdarg.h>
 
 // ============================================================================
-//                             CONSTANTS & MACROS
+// MISSING FUNCTION
 // ============================================================================
-
-#define KUSER_SHARED_DATA_KERNELMODE 0xFFFFF78000000000ULL
-
-#define EFER_SVME         (1ULL << 12)
-#define EFER_LME          (1ULL << 8)
-#define EFER_LMA          (1ULL << 10)
-#define EFER_NXE          (1ULL << 11)
-#define EFER_SCE          (1ULL << 0)
-
-#define X86_FLAGS_TF      (1U << 8)
-#define X86_FLAGS_IF      (1U << 9)
-#define BRANCH_SINGLE_STEP (1U << 1)
-#define SINGLE_STEP       (1U << 14)
-
-#define SVM_INTERCEPT_EXCEPTION_DB (1UL << 1)
-#define SVM_INTERCEPT_EXCEPTION_PF (1UL << 14)
-#define SVM_INTERCEPT_EXCEPTION_AC (1UL << 17)
-#define SVM_INTERCEPT_EXCEPTION_SS (1UL << 12)
-#define SVM_INTERCEPT_MISC1_GDTR_READ (1UL << 7)
-#define SVM_INTERCEPT_MISC1_RDTSC (1UL << 14)
-#define SVM_INTERCEPT_MISC1_RDPMC (1UL << 15)
-#define SVM_INTERCEPT_MISC2_VMMCALL (1UL << 1)
-
-#define CPUID_HV_VENDOR_AND_MAX_FUNCTIONS  0x40000000
-#define CPUID_HV_INTERFACE                 0x40000001
-#define CPUID_UNLOAD_SIMPLE_SVM            0x41414141
-
-#define SVM_MSR_VM_CR      0xC0010114
-#define SVM_MSR_VM_HSAVE_PA 0xC0010117
-#define SVM_MSR_EFER        0xC0000080
-#define IA32_MSR_LSTAR      0xC0000082
-#define IA32_MSR_DEBUGCTL   0x000001D9
-#define IA32_MSR_PAT        0x00000277
-
-#define SVM_VM_CR_SVMDIS    (1UL << 4)
+static UINT32 GetSegmentLimit(UINT16 SegmentSelector)
+{
+    UNREFERENCED_PARAMETER(SegmentSelector);
+    return 0xFFFFFFFF;
+}
 
 // ============================================================================
-//                             TYPE DEFINITIONS
+// GLOBALS
 // ============================================================================
+EXTERN_C UINT64 TargetSysHandler = 0x0;
+EXTERN_C UINT64 OrigLstar = 0x0;
+EXTERN_C const UINT64 TargetDR3 = 0x7FFE0FF0;
+EXTERN_C const UINT64 SyscallBypassMagic = 0x1337133713371337;
 
-#pragma pack(push, 1)
+PVOID NewKuserSharedData = nullptr;
+HANDLE TrackedProcessId = NULL;
+BOOLEAN StopCounterThread = FALSE;
+BOOLEAN ProcessExitCleanup = FALSE;
+BOOLEAN NotifyRoutineActive = FALSE;
+PEPROCESS TargetProcess = nullptr;
+HANDLE TargetProcessId = NULL;
+HANDLE CounterThreadHandle = NULL;
+PMDL KuserMDL = nullptr;
 
-typedef struct _DESCRIPTOR_TABLE_REGISTER {
-    UINT16 Limit;
-    ULONG_PTR Base;
-} DESCRIPTOR_TABLE_REGISTER;
+KSTART_ROUTINE CounterUpdater;
 
-typedef struct _SEGMENT_DESCRIPTOR {
-    union {
+EXTERN_C VOID SyscallHook();
+UINT64 LstarHook = (UINT64)SyscallHook;
+
+typedef struct _NT_KPROCESS
+{
+    DISPATCHER_HEADER Header;
+    LIST_ENTRY        ProfileListHead;
+    ULONG_PTR         DirectoryTableBase;
+    UCHAR             Data[1];
+} NT_KPROCESS, * PNT_KPROCESS;
+
+#define KUSER_SHARED_DATA_KERNELMODE 0xFFFFF78000000000
+
+typedef enum _SYSTEM_INFORMATION_CLASS {
+    SystemBasicInformation = 0,
+    SystemPerformanceInformation = 2,
+    SystemTimeOfDayInformation = 3,
+    SystemProcessInformation = 5,
+    SystemProcessorPerformanceInformation = 8,
+    SystemInterruptInformation = 23,
+    SystemExceptionInformation = 33,
+    SystemRegistryQuotaInformation = 37,
+    SystemLookasideInformation = 45,
+    SystemCodeIntegrityInformation = 103,
+    SystemPolicyInformation = 134,
+} SYSTEM_INFORMATION_CLASS;
+
+#define SystemKernelVaShadowInformation (SYSTEM_INFORMATION_CLASS)196
+
+EXTERN_C __kernel_entry NTSTATUS NTAPI NtQuerySystemInformation(
+    IN SYSTEM_INFORMATION_CLASS SystemInformationClass,
+    OUT PVOID SystemInformation,
+    IN ULONG SystemInformationLength,
+    OUT PULONG ReturnLength OPTIONAL
+);
+
+typedef struct _SYSTEM_KERNEL_VA_SHADOW_INFORMATION
+{
+    struct
+    {
+        ULONG KvaShadowEnabled : 1;
+        ULONG KvaShadowUserGlobal : 1;
+        ULONG KvaShadowPcid : 1;
+        ULONG KvaShadowInvpcid : 1;
+        ULONG KvaShadowRequired : 1;
+        ULONG KvaShadowRequiredAvailable : 1;
+        ULONG InvalidPteBit : 6;
+        ULONG L1DataCacheFlushSupported : 1;
+        ULONG L1TerminalFaultMitigationPresent : 1;
+        ULONG Reserved : 18;
+    } KvaShadowFlags;
+} SYSTEM_KERNEL_VA_SHADOW_INFORMATION, * PSYSTEM_KERNEL_VA_SHADOW_INFORMATION;
+
+EXTERN_C DRIVER_INITIALIZE DriverEntry;
+static DRIVER_UNLOAD SvDriverUnload;
+static CALLBACK_FUNCTION SvPowerCallbackRoutine;
+
+EXTERN_C VOID _sgdt(_Out_ PVOID Descriptor);
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_IRQL_requires_min_(PASSIVE_LEVEL)
+_IRQL_requires_same_
+DECLSPEC_NORETURN
+EXTERN_C
+VOID NTAPI SvLaunchVm(_In_ PVOID HostRsp);
+
+typedef struct _PML4_ENTRY_2MB
+{
+    union
+    {
         UINT64 AsUInt64;
-        struct {
-            UINT16 LimitLow;
-            UINT16 BaseLow;
-            UINT32 BaseMiddle : 8;
-            UINT32 Type : 4;
-            UINT32 System : 1;
-            UINT32 Dpl : 2;
-            UINT32 Present : 1;
-            UINT32 LimitHigh : 4;
-            UINT32 Avl : 1;
-            UINT32 LongMode : 1;
-            UINT32 DefaultBit : 1;
-            UINT32 Granularity : 1;
-            UINT32 BaseHigh : 8;
-        } Fields;
-    };
-} SEGMENT_DESCRIPTOR;
-
-typedef struct _SEGMENT_ATTRIBUTE {
-    union {
-        UINT16 AsUInt16;
-        struct {
-            UINT16 Type : 4;
-            UINT16 System : 1;
-            UINT16 Dpl : 2;
-            UINT16 Present : 1;
-            UINT16 Avl : 1;
-            UINT16 LongMode : 1;
-            UINT16 DefaultBit : 1;
-            UINT16 Granularity : 1;
-            UINT16 Reserved : 4;
-        } Fields;
-    };
-} SEGMENT_ATTRIBUTE;
-
-typedef struct _GUEST_REGISTERS {
-    UINT64 R15, R14, R13, R12, R11, R10, R9, R8;
-    UINT64 Rdi, Rsi, Rbp, Rsp, Rbx, Rdx, Rcx, Rax;
-} GUEST_REGISTERS;
-
-typedef struct _GUEST_CONTEXT {
-    PGUEST_REGISTERS Regs;
-    BOOLEAN ExitVm;
-} GUEST_CONTEXT;
-
-#pragma pack(pop)
-
-// ============================================================================
-//                             GLOBALS (MINIMAL)
-// ============================================================================
-
-static PVOID g_PowerCallbackRegistration = nullptr;
-static ProcessManager* g_ProcessMgr = nullptr;
-static KSPIN_LOCK g_VmcbLock;
-
-// ============================================================================
-//                             FORWARD DECLARATIONS
-// ============================================================================
-
-static VOID SvHandleCpuid(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx);
-static VOID SvHandleMsrAccess(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx);
-static VOID SvHandleVmrun(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx);
-static VOID SvHandleExceptionDb(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx);
-static VOID SvHandleExceptionPf(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx);
-static VOID SvHandleExceptionAc(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx);
-static VOID SvHandleExceptionSs(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx);
-static VOID SvHandleSgdt(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx);
-static VOID SvInjectEvent(PVMCB Vmcb, UINT8 Vector, UINT8 Type, BOOLEAN ErrorCodeValid, UINT32 ErrorCode);
-
-// ============================================================================
-//                             MEMORY MANAGEMENT
-// ============================================================================
-
-static PVOID SvAllocatePageAlignedMemory(SIZE_T Size) {
-    NT_ASSERT(Size >= PAGE_SIZE);
-    PVOID Memory = ExAllocatePool2(POOL_FLAG_NON_PAGED, Size, 'SVMS');
-    if (Memory) {
-        RtlZeroMemory(Memory, Size);
-        NT_ASSERT(((UINT64)Memory & (PAGE_SIZE - 1)) == 0);
-    }
-    return Memory;
-}
-
-static VOID SvFreePageAlignedMemory(PVOID Memory) {
-    if (Memory) ExFreePoolWithTag(Memory, 'SVMS');
-}
-
-static PVOID SvAllocateContiguousMemory(SIZE_T Size) {
-    PHYSICAL_ADDRESS Low, High, Boundary;
-    Low.QuadPart = 0;
-    High.QuadPart = -1;
-    Boundary.QuadPart = 0;
-    
-    PVOID Memory = MmAllocateContiguousNodeMemory(Size, Low, High, Boundary, 
-                                                   PAGE_READWRITE, MM_ANY_NODE_OK);
-    if (Memory) RtlZeroMemory(Memory, Size);
-    return Memory;
-}
-
-static VOID SvFreeContiguousMemory(PVOID Memory) {
-    if (Memory) MmFreeContiguousMemory(Memory);
-}
-
-// ============================================================================
-//                             UTILITY FUNCTIONS
-// ============================================================================
-
-static UINT16 SvGetSegmentAccessRight(UINT16 Selector, ULONG_PTR GdtBase) {
-    PSEGMENT_DESCRIPTOR Desc = (PSEGMENT_DESCRIPTOR)(GdtBase + (Selector & ~3));
-    SEGMENT_ATTRIBUTE Attr;
-    
-    Attr.Fields.Type = Desc->Fields.Type;
-    Attr.Fields.System = Desc->Fields.System;
-    Attr.Fields.Dpl = Desc->Fields.Dpl;
-    Attr.Fields.Present = Desc->Fields.Present;
-    Attr.Fields.Avl = Desc->Fields.Avl;
-    Attr.Fields.LongMode = Desc->Fields.LongMode;
-    Attr.Fields.DefaultBit = Desc->Fields.DefaultBit;
-    Attr.Fields.Granularity = Desc->Fields.Granularity;
-    Attr.Fields.Reserved = 0;
-    
-    return Attr.AsUInt16;
-}
-
-static BOOLEAN SvIsSvmSupported(VOID) {
-    int Regs[4];
-    ULONG64 VmCr;
-    
-    // Check AMD vendor
-    __cpuid(Regs, 0);
-    if (Regs[1] != 'htuA' || Regs[3] != 'itne' || Regs[2] != 'DMAc')
-        return FALSE;
-    
-    // Check SVM feature
-    __cpuid(Regs, 0x80000001);
-    if (!(Regs[2] & (1 << 2))) return FALSE;
-    
-    // Check Nested Paging
-    __cpuid(Regs, 0x8000000A);
-    if (!(Regs[3] & 1)) return FALSE;
-    
-    // Check SVM not disabled
-    VmCr = __readmsr(SVM_MSR_VM_CR);
-    if (VmCr & SVM_VM_CR_SVMDIS) return FALSE;
-    
-    return TRUE;
-}
-
-static BOOLEAN SvIsSimpleSvmInstalled(VOID) {
-    int Regs[4];
-    char VendorId[13];
-    
-    __cpuid(Regs, CPUID_HV_VENDOR_AND_MAX_FUNCTIONS);
-    *(UINT32*)(VendorId + 0) = Regs[1];
-    *(UINT32*)(VendorId + 4) = Regs[2];
-    *(UINT32*)(VendorId + 8) = Regs[3];
-    VendorId[12] = 0;
-    
-    return (strcmp(VendorId, "SimpleSvm   ") == 0);
-}
-
-static BOOLEAN SvIsKvaShadowDisabled(VOID) {
-    // Simplified - return TRUE if KVAShadow is disabled
-    return TRUE;
-}
-
-// ============================================================================
-//                             EVENT INJECTION
-// ============================================================================
-
-static VOID SvInjectEvent(PVMCB Vmcb, UINT8 Vector, UINT8 Type, 
-                          BOOLEAN ErrorCodeValid, UINT32 ErrorCode) {
-    EVENTINJ Event = { 0 };
-    Event.Fields.Vector = Vector;
-    Event.Fields.Type = Type;
-    Event.Fields.ErrorCodeValid = ErrorCodeValid ? 1 : 0;
-    Event.Fields.Valid = 1;
-    if (ErrorCodeValid) Event.Fields.ErrorCode = ErrorCode;
-    Vmcb->ControlArea.EventInj = Event.AsUInt64;
-}
-
-static VOID SvInjectGp(PVMCB Vmcb) {
-    SvInjectEvent(Vmcb, 13, 3, TRUE, 0);
-}
-
-static VOID SvInjectDb(PVMCB Vmcb) {
-    SvInjectEvent(Vmcb, 1, 3, FALSE, 0);
-}
-
-static VOID SvInjectPf(PVMCB Vmcb, UINT32 ErrorCode) {
-    SvInjectEvent(Vmcb, 14, 3, TRUE, ErrorCode);
-}
-
-static VOID SvInjectAc(PVMCB Vmcb) {
-    SvInjectEvent(Vmcb, 17, 3, TRUE, 0);
-}
-
-static VOID SvInjectSs(PVMCB Vmcb, UINT32 ErrorCode) {
-    SvInjectEvent(Vmcb, 12, 3, TRUE, ErrorCode);
-}
-
-// ============================================================================
-//                             MSR PERMISSIONS MAP
-// ============================================================================
-
-static VOID SvBuildMsrPermissionsMap(PVOID Msrpm) {
-    constexpr UINT32 BITS_PER_MSR = 2;
-    constexpr UINT32 SECOND_MSR_RANGE_BASE = 0xC0000000;
-    constexpr UINT32 SECOND_MSRPM_OFFSET = 0x800 * 8; // 0x800 bytes = bits
-    RTL_BITMAP Bitmap;
-    
-    RtlInitializeBitMap(&Bitmap, (PULONG)Msrpm, SVM_MSR_PERMISSIONS_MAP_SIZE * 8);
-    RtlClearAllBits(&Bitmap);
-    
-    // Intercept EFER write
-    UINT32 OffsetFrom2nd = (IA32_MSR_EFER - SECOND_MSR_RANGE_BASE) * BITS_PER_MSR;
-    UINT32 Offset = SECOND_MSRPM_OFFSET + OffsetFrom2nd;
-    RtlSetBits(&Bitmap, Offset + 1, 1);  // Write intercept
-    
-    // Intercept LSTAR read/write
-    OffsetFrom2nd = (IA32_MSR_LSTAR - SECOND_MSR_RANGE_BASE) * BITS_PER_MSR;
-    Offset = SECOND_MSRPM_OFFSET + OffsetFrom2nd;
-    RtlSetBits(&Bitmap, Offset, 2);  // Both read and write
-}
-
-// ============================================================================
-//                             NESTED PAGE TABLES
-// ============================================================================
-
-typedef struct _PML4_ENTRY_2MB {
-    union {
-        UINT64 AsUInt64;
-        struct {
+        struct
+        {
             UINT64 Valid : 1;
             UINT64 Write : 1;
             UINT64 User : 1;
@@ -313,12 +124,16 @@ typedef struct _PML4_ENTRY_2MB {
             UINT64 NoExecute : 1;
         } Fields;
     };
-} PML4_ENTRY_2MB;
+} PML4_ENTRY_2MB, * PPML4_ENTRY_2MB,
+PDPT_ENTRY_2MB, * PPDPT_ENTRY_2MB;
 
-typedef struct _PD_ENTRY_2MB {
-    union {
+typedef struct _PD_ENTRY_2MB
+{
+    union
+    {
         UINT64 AsUInt64;
-        struct {
+        struct
+        {
             UINT64 Valid : 1;
             UINT64 Write : 1;
             UINT64 User : 1;
@@ -336,725 +151,1110 @@ typedef struct _PD_ENTRY_2MB {
             UINT64 NoExecute : 1;
         } Fields;
     };
-} PD_ENTRY_2MB;
+} PD_ENTRY_2MB, * PPD_ENTRY_2MB;
 
-typedef struct _PML4E_TREE {
-    DECLSPEC_ALIGN(PAGE_SIZE) PDPTE_64 PdptEntries[512];
+#include <pshpack1.h>
+typedef struct _DESCRIPTOR_TABLE_REGISTER
+{
+    UINT16 Limit;
+    ULONG_PTR Base;
+} DESCRIPTOR_TABLE_REGISTER, * PDESCRIPTOR_TABLE_REGISTER;
+#include <poppack.h>
+
+typedef struct _SEGMENT_DESCRIPTOR
+{
+    union
+    {
+        UINT64 AsUInt64;
+        struct
+        {
+            UINT16 LimitLow;
+            UINT16 BaseLow;
+            UINT32 BaseMiddle : 8;
+            UINT32 Type : 4;
+            UINT32 System : 1;
+            UINT32 Dpl : 2;
+            UINT32 Present : 1;
+            UINT32 LimitHigh : 4;
+            UINT32 Avl : 1;
+            UINT32 LongMode : 1;
+            UINT32 DefaultBit : 1;
+            UINT32 Granularity : 1;
+            UINT32 BaseHigh : 8;
+        } Fields;
+    };
+} SEGMENT_DESCRIPTOR, * PSEGMENT_DESCRIPTOR;
+
+typedef struct _SEGMENT_ATTRIBUTE
+{
+    union
+    {
+        UINT16 AsUInt16;
+        struct
+        {
+            UINT16 Type : 4;
+            UINT16 System : 1;
+            UINT16 Dpl : 2;
+            UINT16 Present : 1;
+            UINT16 Avl : 1;
+            UINT16 LongMode : 1;
+            UINT16 DefaultBit : 1;
+            UINT16 Granularity : 1;
+            UINT16 Reserved1 : 4;
+        } Fields;
+    };
+} SEGMENT_ATTRIBUTE, * PSEGMENT_ATTRIBUTE;
+
+typedef struct _PML4E_TREE
+{
+    DECLSPEC_ALIGN(PAGE_SIZE) PDPT_ENTRY_2MB PdptEntries[512];
     DECLSPEC_ALIGN(PAGE_SIZE) PD_ENTRY_2MB PdEntries[512][512];
-} PML4E_TREE;
+} PML4E_TREE, * PPML4E_TREE;
 
-typedef struct _SHARED_VIRTUAL_PROCESSOR_DATA {
+typedef struct _SHARED_VIRTUAL_PROCESSOR_DATA
+{
     PVOID MsrPermissionsMap;
     DECLSPEC_ALIGN(PAGE_SIZE) PML4_ENTRY_2MB Pml4Entries[512];
     DECLSPEC_ALIGN(PAGE_SIZE) PML4E_TREE Pml4eTrees[2];
-} SHARED_VIRTUAL_PROCESSOR_DATA;
+} SHARED_VIRTUAL_PROCESSOR_DATA, * PSHARED_VIRTUAL_PROCESSOR_DATA;
 
-static VOID SvBuildNestedPageTables(PSHARED_VIRTUAL_PROCESSOR_DATA Shared) {
-    for (UINT64 Pml4Idx = 0; Pml4Idx < 2; Pml4Idx++) {
-        PPML4_ENTRY_2MB Pml4e = &Shared->Pml4Entries[Pml4Idx];
-        PPML4E_TREE Tree = &Shared->Pml4eTrees[Pml4Idx];
-        
-        UINT64 PdptPa = MmGetPhysicalAddress(&Tree->PdptEntries).QuadPart;
-        Pml4e->Fields.PageFrameNumber = PdptPa >> PAGE_SHIFT;
-        Pml4e->Fields.Valid = 1;
-        Pml4e->Fields.Write = 1;
-        Pml4e->Fields.User = 1;
-        
-        for (UINT64 PdptIdx = 0; PdptIdx < 512; PdptIdx++) {
-            UINT64 PdPa = MmGetPhysicalAddress(&Tree->PdEntries[PdptIdx][0]).QuadPart;
-            Tree->PdptEntries[PdptIdx].Fields.PageFrameNumber = PdPa >> PAGE_SHIFT;
-            Tree->PdptEntries[PdptIdx].Fields.Present = 1;
-            Tree->PdptEntries[PdptIdx].Fields.Write = 1;
-            Tree->PdptEntries[PdptIdx].Fields.Supervisor = 1;
-            
-            for (UINT64 PdIdx = 0; PdIdx < 512; PdIdx++) {
-                UINT64 TranslationPa = (Pml4Idx * 512 * 512) + (PdptIdx * 512) + PdIdx;
-                Tree->PdEntries[PdptIdx][PdIdx].Fields.PageFrameNumber = TranslationPa;
-                Tree->PdEntries[PdptIdx][PdIdx].Fields.Valid = 1;
-                Tree->PdEntries[PdptIdx][PdIdx].Fields.Write = 1;
-                Tree->PdEntries[PdptIdx][PdIdx].Fields.User = 1;
-                Tree->PdEntries[PdptIdx][PdIdx].Fields.LargePage = 1;
-            }
-        }
-    }
-}
-
-// ============================================================================
-//                             VIRTUAL PROCESSOR DATA
-// ============================================================================
-
-typedef struct _VIRTUAL_PROCESSOR_DATA {
-    union {
-        DECLSPEC_ALIGN(PAGE_SIZE) UINT8 HostStack[KERNEL_STACK_SIZE];
-        struct {
-            UINT8 Stack[KERNEL_STACK_SIZE - sizeof(KTRAP_FRAME) - sizeof(PVOID) * 8];
+typedef struct _VIRTUAL_PROCESSOR_DATA
+{
+    union
+    {
+        DECLSPEC_ALIGN(PAGE_SIZE) UINT8 HostStackLimit[KERNEL_STACK_SIZE];
+        struct
+        {
+            UINT8 StackContents[KERNEL_STACK_SIZE - (sizeof(PVOID) * 6) - sizeof(KTRAP_FRAME)];
             KTRAP_FRAME TrapFrame;
             UINT64 GuestVmcbPa;
             UINT64 HostVmcbPa;
             struct _VIRTUAL_PROCESSOR_DATA* Self;
-            PSHARED_VIRTUAL_PROCESSOR_DATA Shared;
-            UINT64 Padding;
-            UINT64 Magic;  // Must be MAXUINT64
-        } Layout;
+            PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData;
+            UINT64 Padding1;
+            UINT64 Reserved1;
+        } HostStackLayout;
     };
-    
     DECLSPEC_ALIGN(PAGE_SIZE) VMCB GuestVmcb;
     DECLSPEC_ALIGN(PAGE_SIZE) VMCB HostVmcb;
     DECLSPEC_ALIGN(PAGE_SIZE) UINT8 HostStateArea[PAGE_SIZE];
-} VIRTUAL_PROCESSOR_DATA;
+} VIRTUAL_PROCESSOR_DATA, * PVIRTUAL_PROCESSOR_DATA;
 
-static_assert(sizeof(VIRTUAL_PROCESSOR_DATA) == KERNEL_STACK_SIZE + PAGE_SIZE * 3,
-              "VIRTUAL_PROCESSOR_DATA size mismatch");
+typedef struct _GUEST_REGISTERS
+{
+    UINT64 R15, R14, R13, R12, R11, R10, R9, R8;
+    UINT64 Rdi, Rsi, Rbp, Rsp, Rbx, Rdx, Rcx, Rax;
+} GUEST_REGISTERS, * PGUEST_REGISTERS;
 
-// ============================================================================
-//                             VMEXIT HANDLERS
-// ============================================================================
+typedef struct _GUEST_CONTEXT
+{
+    PGUEST_REGISTERS VpRegs;
+    BOOLEAN ExitVm;
+} GUEST_CONTEXT, * PGUEST_CONTEXT;
 
-static VOID SvHandleCpuid(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx) {
-    int Regs[4];
-    INT Leaf = (INT)GuestCtx->Regs->Rax;
-    INT SubLeaf = (INT)GuestCtx->Regs->Rcx;
-    SEGMENT_ATTRIBUTE Attr;
-    
-    // Check for backdoor requests (CPL=3, DR3 magic)
-    if (Vmcb->StateSaveArea.Cpl == 3) {
-        UINT64 Dr3 = __readdr(3);
-        UINT64 Dr7 = Vmcb->StateSaveArea.Dr7;
-        
-        if (Dr3 == TARGET_DR3 && (Dr7 & 0xF0000040) == 0x40) {
-            // Magic backdoor requests
-            if (Leaf == 0x1) {
-                // Spoof CPUID leaf 1
-                GuestCtx->Regs->Rax = 0x00A20F12;
-                GuestCtx->Regs->Rbx = 0x00100800;
-                GuestCtx->Regs->Rcx = 0x7EF8320B & ~((1<<12)|(1<<25)|(1<<26)|(1<<27)|(1<<28)|(1<<29)|(1<<30));
-                GuestCtx->Regs->Rdx = 0x178BFBFF;
-                goto AdvanceRip;
-            }
-            
-            if (Leaf == 0x1337 && ProcessManager::IsTrackingActive() == FALSE) {
-                // Request process tracking
-                HANDLE Pid = (HANDLE)GuestCtx->Regs->Rdx;
-                NTSTATUS Status = ProcessManager::RequestTracking(Pid, GuestCtx->Regs->Rcx);
-                GuestCtx->Regs->Rax = Status;
-                goto AdvanceRip;
-            }
-            
-            if (Leaf == 0x1338 && ProcessManager::IsTrackingActive()) {
-                ProcessManager::StopTracking();
-                GuestCtx->Regs->Rax = STATUS_SUCCESS;
-                goto AdvanceRip;
-            }
-            
-            if (Leaf == 0x336933) {
-                // Set syscall handler
-                ProcessManager::UpdateSyscallHandler(GuestCtx->Regs->Rcx);
-                goto AdvanceRip;
-            }
+#define IA32_MSR_PAT      0x00000277
+#define IA32_MSR_EFER     0xc0000080
+#define IA32_MSR_LSTAR    0xC0000082
+#define IA32_MSR_DEBUGCTL 0x000001D9
+#define EFER_SVME         (1UL << 12)
+#define X86_FLAGS_TF      (1U<<8)
+#define X86_FLAGS_IF      (1U<<9)
+#define BranchSingleStep  (1U<<1)
+#define SingleStep        (1U<<14)
+
+#define SVM_InterceptException_DB       (1UL << 1)
+#define SVM_INTERCEPT_MISC1_GDTR_READ   (1UL << 7)
+#define UMIP                            (1UL << 11)
+#define SVM_InterceptException_SS       (1UL << 12)
+#define SVM_InterceptException_PF       (1UL << 14)
+#define SVM_InterceptException_AC       (1UL << 17)
+#define SVM_INTERCEPT_MISC2_VMMCALL     (1UL << 1)
+#define SVM_INTERCEPT_MISC1_RDTSC       (1UL << 14)
+#define SVM_INTERCEPT_MISC1_RDPMC       (1UL << 15)
+
+#define RPL_MASK        3
+#define DPL_SYSTEM      0
+
+#define CPUID_FN8000_0001_ECX_SVM                   (1UL << 2)
+#define CPUID_FN0000_0001_ECX_HYPERVISOR_PRESENT    (1UL << 31)
+#define CPUID_FN8000_000A_EDX_NP                    (1UL << 0)
+
+#define CPUID_MAX_STANDARD_FN_NUMBER_AND_VENDOR_STRING         0x00000000
+#define CPUID_PROCESSOR_AND_PROCESSOR_FEATURE_IDENTIFIERS      0x00000001
+#define CPUID_PROCESSOR_AND_PROCESSOR_FEATURE_IDENTIFIERS_EX   0x80000001
+#define CPUID_SVM_FEATURES                                     0x8000000a
+#define CPUID_HV_VENDOR_AND_MAX_FUNCTIONS                      0x40000000
+#define CPUID_HV_INTERFACE                                     0x40000001
+#define CPUID_UNLOAD_SIMPLE_SVM                                0x41414141
+#define CPUID_HV_MAX                CPUID_HV_INTERFACE
+
+static PVOID g_PowerCallbackRegistration;
+
+static VOID SvDebugPrint(PCSTR Format, ...)
+{
+    va_list argList;
+    va_start(argList, Format);
+    vDbgPrintExWithPrefix("[SimpleSvm] ", DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, Format, argList);
+    va_end(argList);
+}
+
+static PVOID SvAllocatePageAlingedPhysicalMemory(SIZE_T NumberOfBytes)
+{
+    PVOID memory = ExAllocatePool2(POOL_FLAG_NON_PAGED, NumberOfBytes, 'MVSS');
+    if (memory != nullptr) RtlZeroMemory(memory, NumberOfBytes);
+    return memory;
+}
+
+static VOID SvFreePageAlingedPhysicalMemory(PVOID BaseAddress)
+{
+    ExFreePoolWithTag(BaseAddress, 'MVSS');
+}
+
+static PVOID SvAllocateContiguousMemory(SIZE_T NumberOfBytes)
+{
+    PHYSICAL_ADDRESS boundary, lowest, highest;
+    boundary.QuadPart = lowest.QuadPart = 0;
+    highest.QuadPart = -1;
+    return MmAllocateContiguousNodeMemory(NumberOfBytes, lowest, highest, boundary, PAGE_READWRITE, MM_ANY_NODE_OK);
+}
+
+static VOID SvFreeContiguousMemory(PVOID BaseAddress)
+{
+    MmFreeContiguousMemory(BaseAddress);
+}
+
+static VOID SvInjectGeneralProtectionException(PVIRTUAL_PROCESSOR_DATA VpData)
+{
+    EVENTINJ event = {0};
+    event.Fields.Vector = 13;
+    event.Fields.Type = 3;
+    event.Fields.ErrorCodeValid = 1;
+    event.Fields.Valid = 1;
+    VpData->GuestVmcb.ControlArea.EventInj = event.AsUInt64;
+}
+
+static VOID SvInjectDbException(PVIRTUAL_PROCESSOR_DATA VpData)
+{
+    EVENTINJ event = {0};
+    event.Fields.Vector = 1;
+    event.Fields.Type = 3;
+    event.Fields.Valid = 1;
+    VpData->GuestVmcb.ControlArea.EventInj = event.AsUInt64;
+}
+
+static VOID SvInjectPFException(PVIRTUAL_PROCESSOR_DATA VpData)
+{
+    EVENTINJ event = {0};
+    event.Fields.Vector = 14;
+    event.Fields.Type = 3;
+    event.Fields.ErrorCodeValid = 1;
+    event.Fields.Valid = 1;
+    event.Fields.ErrorCode = VpData->GuestVmcb.ControlArea.ExitInfo1;
+    VpData->GuestVmcb.ControlArea.EventInj = event.AsUInt64;
+}
+
+static VOID SvInjectACException(PVIRTUAL_PROCESSOR_DATA VpData)
+{
+    EVENTINJ event = {0};
+    event.Fields.Vector = 17;
+    event.Fields.Type = 3;
+    event.Fields.ErrorCodeValid = 1;
+    event.Fields.Valid = 1;
+    VpData->GuestVmcb.ControlArea.EventInj = event.AsUInt64;
+}
+
+static VOID SvInjectSsException(PVIRTUAL_PROCESSOR_DATA VpData)
+{
+    EVENTINJ event = {0};
+    event.Fields.Vector = 12;
+    event.Fields.Type = 3;
+    event.Fields.ErrorCodeValid = 1;
+    event.Fields.Valid = 1;
+    event.Fields.ErrorCode = VpData->GuestVmcb.ControlArea.ExitInfo1;
+    VpData->GuestVmcb.ControlArea.EventInj = event.AsUInt64;
+}
+
+UINT64 GetCr3ByProcessId(HANDLE ProcessId)
+{
+    PEPROCESS TargetEprocess = nullptr;
+    UINT64 ProcessCr3 = 0x0;
+    if (PsLookupProcessByProcessId(ProcessId, &TargetEprocess) != STATUS_SUCCESS) return ProcessCr3;
+    NT_KPROCESS* CurrentProcess = (NT_KPROCESS*)(TargetEprocess);
+    ProcessCr3 = CurrentProcess->DirectoryTableBase;
+    ObDereferenceObject(TargetEprocess);
+    return ProcessCr3;
+}
+
+EXTERN_C NTSTATUS NTAPI PsAcquireProcessExitSynchronization(PEPROCESS Process);
+EXTERN_C VOID NTAPI PsReleaseProcessExitSynchronization(PEPROCESS Process);
+
+PVOID PfnToVirtualAddr(uintptr_t pfn)
+{
+    PHYSICAL_ADDRESS pa = {0};
+    pa.QuadPart = pfn << PAGE_SHIFT;
+    return MmGetVirtualForPhysical(pa);
+}
+
+PT_ENTRY_64* GetPte(UINT64 virtual_address, uintptr_t pml4_base_pa)
+{
+    AddressTranslationHelper helper = {0};
+    helper.as_int64 = (uintptr_t)virtual_address;
+    PHYSICAL_ADDRESS pml4_physical = {0};
+    pml4_physical.QuadPart = pml4_base_pa;
+    PML4E_64* pml4 = (PML4E_64*)MmGetVirtualForPhysical(pml4_physical);
+    if (pml4 == NULL) return NULL;
+    PML4E_64* pml4e = &pml4[helper.AsIndex.pml4];
+    if (pml4e->Fields.Present == FALSE) return NULL;
+    PDPTE_64* pdpt = (PDPTE_64*)PfnToVirtualAddr(pml4e->Fields.PageFrameNumber);
+    if (pdpt == NULL) return NULL;
+    PDPTE_64* pdpte = &pdpt[helper.AsIndex.pdpt];
+    if (pdpte->Fields.LargePage == TRUE) return (PT_ENTRY_64*)pdpte;
+    if (pdpte->Fields.Present == FALSE) return NULL;
+    PDE_64* pd = (PDE_64*)PfnToVirtualAddr(pdpte->Fields.PageFrameNumber);
+    if (pd == NULL) return NULL;
+    PDE_64* pde = &pd[helper.AsIndex.pd];
+    if (pde->Fields.LargePage == TRUE) return (PT_ENTRY_64*)pde;
+    if (pde->Fields.Present == FALSE) return NULL;
+    PTE_64* pt = (PTE_64*)PfnToVirtualAddr(pde->Fields.PageFrameNumber);
+    if (pt == NULL) return NULL;
+    PTE_64* pte = &pt[helper.AsIndex.pt];
+    return (PT_ENTRY_64*)pte;
+}
+
+VOID ProcessExitNotifyRoutine(HANDLE ParentId, HANDLE ProcessId, BOOLEAN Create)
+{
+    UNREFERENCED_PARAMETER(ParentId);
+    if (Create == FALSE && ProcessId == TrackedProcessId) ProcessExitCleanup = TRUE;
+}
+
+VOID CleanupKuser()
+{
+    if (TrackedProcessId && ProcessExitCleanup)
+    {
+        if (NewKuserSharedData && KuserMDL)
+        {
+            MmUnmapLockedPages(NewKuserSharedData, KuserMDL);
+            MmUnlockPages(KuserMDL);
+            IoFreeMdl(KuserMDL);
+            NewKuserSharedData = nullptr;
+            KuserMDL = nullptr;
+            PsReleaseProcessExitSynchronization(TargetProcess);
+            ObDereferenceObject(TargetProcess);
+            TargetSysHandler = NULL;
+            TrackedProcessId = NULL;
+            TargetProcess = nullptr;
+            ProcessExitCleanup = FALSE;
         }
     }
-    
-    // Normal CPUID execution
-    __cpuidex(Regs, Leaf, SubLeaf);
-    
-    switch (Leaf) {
-        case 1:
-            Regs[2] |= (1 << 31);  // Hypervisor present
-            break;
-            
-        case CPUID_HV_VENDOR_AND_MAX_FUNCTIONS:
-            Regs[0] = CPUID_HV_INTERFACE;
-            Regs[1] = 'pmiS';
-            Regs[2] = 'vSel';
-            Regs[3] = '   m';
-            break;
-            
-        case CPUID_HV_INTERFACE:
-            Regs[0] = '0#vH';  // Hv#0
-            Regs[1] = 0;
-            Regs[2] = 0;
-            Regs[3] = 0;
-            break;
-            
-        case CPUID_UNLOAD_SIMPLE_SVM:
-            if (SubLeaf == CPUID_UNLOAD_SIMPLE_SVM) {
-                Attr.AsUInt16 = Vmcb->StateSaveArea.SsAttrib;
-                if (Attr.Fields.Dpl == 0) {  // Kernel mode request
-                    GuestCtx->ExitVm = TRUE;
+}
+
+VOID CounterUpdater(PVOID StartContext)
+{
+    UNREFERENCED_PARAMETER(StartContext);
+    LARGE_INTEGER TimeToWait = {0};
+    TimeToWait.QuadPart = -10000LL;
+    while (StopCounterThread == FALSE)
+    {
+        if (TargetProcessId)
+        {
+            NTSTATUS status = PsLookupProcessByProcessId(TargetProcessId, &TargetProcess);
+            if (NT_SUCCESS(status))
+            {
+                status = PsAcquireProcessExitSynchronization(TargetProcess);
+                if (!NT_SUCCESS(status))
+                {
+                    ObDereferenceObject(TargetProcess);
+                    TargetProcessId = NULL;
+                    TargetSysHandler = NULL;
+                    TargetProcess = nullptr;
+                    SvDebugPrint("Failed to AcquireProcessExitSynchronization\n");
+                    goto End;
                 }
             }
-            break;
-    }
-    
-    GuestCtx->Regs->Rax = (UINT32)Regs[0];
-    GuestCtx->Regs->Rbx = (UINT32)Regs[1];
-    GuestCtx->Regs->Rcx = (UINT32)Regs[2];
-    GuestCtx->Regs->Rdx = (UINT32)Regs[3];
-    
-AdvanceRip:
-    Vmcb->StateSaveArea.Rip = Vmcb->ControlArea.NRip;
-    
-    // Handle single-step trap
-    if ((Vmcb->StateSaveArea.Rflags & X86_FLAGS_TF) && 
-        !(__readmsr(IA32_MSR_DEBUGCTL) & BRANCH_SINGLE_STEP)) {
-        Vmcb->StateSaveArea.Dr6 |= SINGLE_STEP;
-        SvInjectDb(Vmcb);
-    }
-}
-
-static VOID SvHandleMsrAccess(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx) {
-    ULARGE_INTEGER Value;
-    UINT32 Msr = (UINT32)GuestCtx->Regs->Rcx;
-    BOOLEAN Write = (Vmcb->ControlArea.ExitInfo1 != 0);
-    
-    if (Msr == IA32_MSR_LSTAR) {
-        if (Write) {
-            Value.LowPart = (UINT32)GuestCtx->Regs->Rax;
-            Value.HighPart = (UINT32)GuestCtx->Regs->Rdx;
-            Vmcb->StateSaveArea.LStar = Value.QuadPart;
-        } else {
-            Value.QuadPart = Vmcb->StateSaveArea.LStar;
-            GuestCtx->Regs->Rax = Value.LowPart;
-            GuestCtx->Regs->Rdx = Value.HighPart;
+            else
+            {
+                TargetSysHandler = NULL;
+                TargetProcess = nullptr;
+                TargetProcessId = NULL;
+                SvDebugPrint("Failed to LookupProcessByProcessId\n");
+                goto End;
+            }
+            TrackedProcessId = TargetProcessId;
+            TargetProcessId = NULL;
+            UINT64 TargetCr3 = GetCr3ByProcessId(TrackedProcessId);
+            KAPC_STATE State = {0};
+            KeStackAttachProcess(TargetProcess, &State);
+            PT_ENTRY_64* TargetProcessKuserPte = GetPte(0x7FFE0000, TargetCr3);
+            if (!NewKuserSharedData)
+            {
+                if (TargetProcessKuserPte)
+                {
+                    TargetProcessKuserPte->Fields.Ignored1 = 0b001;
+                    KuserMDL = IoAllocateMdl((PVOID)0x7FFE0000, PAGE_SIZE, FALSE, FALSE, NULL);
+                    MmProbeAndLockPages(KuserMDL, UserMode, IoWriteAccess);
+                    KeUnstackDetachProcess(&State);
+                    NewKuserSharedData = MmMapLockedPagesSpecifyCache(KuserMDL, KernelMode, MmCached, NULL, FALSE, HighPagePriority);
+                }
+                else KeUnstackDetachProcess(&State);
+            }
+            if (NewKuserSharedData)
+            {
+                UINT64 NewKusdAddress = (UINT64)NewKuserSharedData;
+                *(UINT64*)(NewKusdAddress + 0x260) = 0x0100006658;
+                *(UINT32*)(NewKusdAddress + 0x268) = 0x090001;
+                *(UINT32*)(NewKusdAddress + 0x26C) = 0xA;
+                *(UINT32*)(NewKusdAddress + 0x270) = 0x0;
+                *(UINT32*)(NewKusdAddress + 0x274) = 0x01010000;
+                *(UINT32*)(NewKusdAddress + 0x278) = 0x010000;
+                *(UINT32*)(NewKusdAddress + 0x27C) = 0x010101;
+                *(UINT32*)(NewKusdAddress + 0x280) = 0x010101;
+                *(UINT32*)(NewKusdAddress + 0x284) = 0x0100;
+                *(UINT32*)(NewKusdAddress + 0x288) = 0x01010101;
+                *(UINT32*)(NewKusdAddress + 0x28C) = 0x0;
+                *(UINT32*)(NewKusdAddress + 0x290) = 0x01;
+                *(UINT32*)(NewKusdAddress + 0x294) = 0x01000101;
+                *(UINT32*)(NewKusdAddress + 0x298) = 0x01010101;
+                *(UINT32*)(NewKusdAddress + 0x29C) = 0x010001;
+                *(UINT32*)(NewKusdAddress + 0x2A0) = 0x0;
+                *(UINT32*)(NewKusdAddress + 0x2A4) = 0x0;
+                *(UINT32*)(NewKusdAddress + 0x2A8) = 0x0;
+                *(UINT32*)(NewKusdAddress + 0x2AC) = 0x0;
+                *(UINT32*)(NewKusdAddress + 0x2B0) = 0x1;
+                *(UINT8*)(NewKusdAddress + 0x290) = 0x0;
+                *(UINT8*)(NewKusdAddress + 0x294) = 0x0;
+                *(UINT8*)(NewKusdAddress + 0x295) = 0x0;
+                *(UINT8*)(NewKusdAddress + 0x297) = 0x0;
+                *(UINT8*)(NewKusdAddress + 0x285) = 0x0;
+                *(UINT8*)(NewKusdAddress + 0x29B) = 0x0;
+                *(UINT8*)(NewKusdAddress + 0x29C) = 0x0;
+                *(UINT64*)(NewKusdAddress + 0x3D8) = 0x0;
+                *(UINT64*)(NewKusdAddress + 0x3E0) = 0x0;
+                *(UINT32*)(NewKusdAddress + 0x3EC) = 0x0;
+                memset((void*)(NewKusdAddress + 0x3F0), 0x00, 0x200);
+                *(UINT64*)(NewKusdAddress + 0x5F0) = 0x0;
+                *(UINT64*)(NewKusdAddress + 0x5F8) = 0x0;
+                memset((void*)(NewKusdAddress + 0x604), 0x00, 0x200);
+                *(UINT64*)(NewKusdAddress + 0x808) = 0x0;
+                *(UINT64*)(NewKusdAddress + 0x810) = 0x0;
+                *(UINT64*)(NewKusdAddress + 0x2D0) = 0x320A0000000110;
+                *(UINT64*)(NewKusdAddress + 0x2E8) = 0x0100007FB10B;
+                *(UINT32*)(NewKusdAddress + 0x2F4) = 0x0;
+                *(UINT64*)(NewKusdAddress + 0x36C) = 0x0;
+                *(UINT64*)(NewKusdAddress + 0x374) = 0x0;
+                *(UINT32*)(NewKusdAddress + 0x37C) = 0x1;
+                *(UINT64*)(NewKusdAddress + 0x3C0) = 0x83000100000010;
+                *(UINT32*)(NewKusdAddress + 0xFFC) = 0x13371337;
+            }
+            if (!NotifyRoutineActive) {
+                if (NT_SUCCESS(PsSetCreateProcessNotifyRoutine(ProcessExitNotifyRoutine, FALSE))) NotifyRoutineActive = TRUE;
+            }
         }
-        goto AdvanceRip;
-    }
-    
-    if (Msr == IA32_MSR_EFER) {
-        if (!Write) {
-            Value.QuadPart = Vmcb->StateSaveArea.Efer;
-            GuestCtx->Regs->Rax = Value.LowPart;
-            GuestCtx->Regs->Rdx = Value.HighPart;
-            goto AdvanceRip;
+    End:
+        KeDelayExecutionThread(KernelMode, FALSE, &TimeToWait);
+        if (NewKuserSharedData)
+        {
+            PKUSER_SHARED_DATA TargetSpoofedKuserSharedData = (PKUSER_SHARED_DATA)NewKuserSharedData;
+            PKUSER_SHARED_DATA KernelKuserSharedData = (PKUSER_SHARED_DATA)(KUSER_SHARED_DATA_KERNELMODE);
+            *(ULONG64*)&TargetSpoofedKuserSharedData->InterruptTime = *(ULONG64*)&KernelKuserSharedData->InterruptTime.LowPart;
+            TargetSpoofedKuserSharedData->InterruptTime.High2Time = TargetSpoofedKuserSharedData->InterruptTime.High1Time;
+            *(ULONG64*)&TargetSpoofedKuserSharedData->SystemTime = *(ULONG64*)&KernelKuserSharedData->SystemTime.LowPart;
+            TargetSpoofedKuserSharedData->SystemTime.High2Time = TargetSpoofedKuserSharedData->SystemTime.High1Time;
+            TargetSpoofedKuserSharedData->LastSystemRITEventTickCount = KernelKuserSharedData->LastSystemRITEventTickCount;
+            *(ULONG64*)&TargetSpoofedKuserSharedData->TickCount = *(ULONG64*)&KernelKuserSharedData->TickCount.LowPart;
+            TargetSpoofedKuserSharedData->TickCount.High2Time = TargetSpoofedKuserSharedData->TickCount.High1Time;
+            TargetSpoofedKuserSharedData->TimeUpdateLock = KernelKuserSharedData->TimeUpdateLock;
+            TargetSpoofedKuserSharedData->BaselineSystemTimeQpc = KernelKuserSharedData->BaselineSystemTimeQpc;
+            TargetSpoofedKuserSharedData->BaselineInterruptTimeQpc = TargetSpoofedKuserSharedData->BaselineSystemTimeQpc;
         }
-        
-        Value.LowPart = (UINT32)GuestCtx->Regs->Rax;
-        Value.HighPart = (UINT32)GuestCtx->Regs->Rdx;
-        
-        // Protect SVME bit from being cleared
-        if ((Value.QuadPart & EFER_SVME) == 0) {
-            SvInjectGp(Vmcb);
-            return;
+        if (ProcessExitCleanup) CleanupKuser();
+    }
+    if (NotifyRoutineActive)
+    {
+        PsSetCreateProcessNotifyRoutine(ProcessExitNotifyRoutine, TRUE);
+        NotifyRoutineActive = FALSE;
+        CleanupKuser();
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static VOID SvHandleCpuid(PVIRTUAL_PROCESSOR_DATA VpData, PGUEST_CONTEXT GuestContext)
+{
+    int registers[4];
+    int leaf = (int)GuestContext->VpRegs->Rax;
+    int subLeaf = (int)GuestContext->VpRegs->Rcx;
+    SEGMENT_ATTRIBUTE attribute;
+    if (VpData->GuestVmcb.StateSaveArea.Cpl == 0x3)
+    {
+        UINT64 CurrentDR3 = __readdr(3);
+        UINT64 CurrentDR7 = VpData->GuestVmcb.StateSaveArea.Dr7;
+        if (CurrentDR3 == TargetDR3 && (CurrentDR7 & 0xF0000040) == 0x40)
+        {
+            if (leaf == 0x1)
+            {
+                GuestContext->VpRegs->Rax = 0x00A20F12;
+                GuestContext->VpRegs->Rbx = 0x00100800;
+                GuestContext->VpRegs->Rcx = 0x7EF8320B & ~((1<<12)|(1<<25)|(1<<26)|(1<<27)|(1<<28)|(1<<29)|(1<<30));
+                GuestContext->VpRegs->Rdx = 0x178BFBFF;
+                goto Exit;
+            }
+            if (GuestContext->VpRegs->Rax == 0x336933)
+            {
+                if (!TargetSysHandler) TargetSysHandler = GuestContext->VpRegs->Rcx;
+                goto doCpuid;
+            }
+            if (GuestContext->VpRegs->Rax == 0x1337)
+            {
+                if (!TrackedProcessId) TargetProcessId = (HANDLE)GuestContext->VpRegs->Rdx;
+                goto doCpuid;
+            }
         }
-        
-        // Validate EFER bits
-        UINT64 Allowed = EFER_SCE | EFER_LME | EFER_LMA | EFER_NXE | EFER_SVME;
-        if (Value.QuadPart & ~Allowed) {
-            SvInjectGp(Vmcb);
-            return;
+    }
+doCpuid:
+    __cpuidex(registers, leaf, subLeaf);
+    switch (leaf)
+    {
+    case CPUID_PROCESSOR_AND_PROCESSOR_FEATURE_IDENTIFIERS:
+        registers[2] |= CPUID_FN0000_0001_ECX_HYPERVISOR_PRESENT;
+        break;
+    case CPUID_HV_VENDOR_AND_MAX_FUNCTIONS:
+        registers[0] = CPUID_HV_MAX;
+        registers[1] = 'pmiS';
+        registers[2] = 'vSel';
+        registers[3] = '   m';
+        break;
+    case CPUID_HV_INTERFACE:
+        registers[0] = '0#vH';
+        registers[1] = registers[2] = registers[3] = 0;
+        break;
+    case CPUID_UNLOAD_SIMPLE_SVM:
+        if (subLeaf == CPUID_UNLOAD_SIMPLE_SVM)
+        {
+            attribute.AsUInt16 = VpData->GuestVmcb.StateSaveArea.SsAttrib;
+            if (attribute.Fields.Dpl == DPL_SYSTEM) GuestContext->ExitVm = TRUE;
         }
-        
-        Vmcb->StateSaveArea.Efer = Value.QuadPart;
-        goto AdvanceRip;
+        break;
     }
-    
-    // Pass-through other MSRs
-    if (Write) {
-        Value.LowPart = (UINT32)GuestCtx->Regs->Rax;
-        Value.HighPart = (UINT32)GuestCtx->Regs->Rdx;
-        __writemsr(Msr, Value.QuadPart);
-    } else {
-        Value.QuadPart = __readmsr(Msr);
-        GuestCtx->Regs->Rax = Value.LowPart;
-        GuestCtx->Regs->Rdx = Value.HighPart;
-    }
-    
-AdvanceRip:
-    Vmcb->StateSaveArea.Rip = Vmcb->ControlArea.NRip;
-}
-
-static VOID SvHandleVmrun(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx) {
-    UNREFERENCED_PARAMETER(GuestCtx);
-    SvInjectGp(Vmcb);
-}
-
-static VOID SvHandleExceptionDb(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx) {
-    UNREFERENCED_PARAMETER(GuestCtx);
-    
-    // Re-enable intercepts that were temporarily disabled
-    Vmcb->ControlArea.InterceptException |= SVM_INTERCEPT_EXCEPTION_PF;
-    Vmcb->ControlArea.InterceptException |= SVM_INTERCEPT_EXCEPTION_AC;
-    Vmcb->ControlArea.InterceptException |= SVM_INTERCEPT_EXCEPTION_SS;
-    Vmcb->ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_GDTR_READ;
-    
-    SvInjectDb(Vmcb);
-}
-
-static VOID SvHandleExceptionPf(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx) {
-    UNREFERENCED_PARAMETER(GuestCtx);
-    
-    // Restore IF and TF if needed
-    if (Vmcb->ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDPMC) {
-        Vmcb->StateSaveArea.Rflags |= X86_FLAGS_IF;
-        Vmcb->ControlArea.InterceptMisc1 &= ~SVM_INTERCEPT_MISC1_RDPMC;
-    }
-    
-    if (Vmcb->ControlArea.InterceptMisc2 & SVM_INTERCEPT_MISC2_VMMCALL) {
-        UINT64 DebugCtl = __readmsr(IA32_MSR_DEBUGCTL);
-        DebugCtl |= BRANCH_SINGLE_STEP;
-        __writemsr(IA32_MSR_DEBUGCTL, DebugCtl);
-        Vmcb->ControlArea.InterceptMisc2 &= ~SVM_INTERCEPT_MISC2_VMMCALL;
-    }
-    
-    if (Vmcb->ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDTSC) {
-        Vmcb->ControlArea.InterceptMisc1 &= ~SVM_INTERCEPT_MISC1_RDTSC;
-    } else {
-        Vmcb->StateSaveArea.Rflags &= ~X86_FLAGS_TF;
-    }
-    
-    // Restore correct GDTR
-    DESCRIPTOR_TABLE_REGISTER Gdtr;
-    _sgdt(&Gdtr);
-    Vmcb->StateSaveArea.GdtrLimit = Gdtr.Limit;
-    
-    Vmcb->StateSaveArea.Cr2 = Vmcb->ControlArea.ExitInfo2;
-    SvInjectPf(Vmcb, (UINT32)Vmcb->ControlArea.ExitInfo1);
-}
-
-static VOID SvHandleExceptionAc(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx) {
-    UNREFERENCED_PARAMETER(GuestCtx);
-    
-    if (Vmcb->ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDPMC) {
-        Vmcb->StateSaveArea.Rflags |= X86_FLAGS_IF;
-        Vmcb->ControlArea.InterceptMisc1 &= ~SVM_INTERCEPT_MISC1_RDPMC;
-    }
-    
-    if (Vmcb->ControlArea.InterceptMisc2 & SVM_INTERCEPT_MISC2_VMMCALL) {
-        UINT64 DebugCtl = __readmsr(IA32_MSR_DEBUGCTL);
-        DebugCtl |= BRANCH_SINGLE_STEP;
-        __writemsr(IA32_MSR_DEBUGCTL, DebugCtl);
-        Vmcb->ControlArea.InterceptMisc2 &= ~SVM_INTERCEPT_MISC2_VMMCALL;
-    }
-    
-    if (Vmcb->ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDTSC) {
-        Vmcb->ControlArea.InterceptMisc1 &= ~SVM_INTERCEPT_MISC1_RDTSC;
-    } else {
-        Vmcb->StateSaveArea.Rflags &= ~X86_FLAGS_TF;
-    }
-    
-    DESCRIPTOR_TABLE_REGISTER Gdtr;
-    _sgdt(&Gdtr);
-    Vmcb->StateSaveArea.GdtrLimit = Gdtr.Limit;
-    
-    SvInjectAc(Vmcb);
-}
-
-static VOID SvHandleExceptionSs(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx) {
-    UNREFERENCED_PARAMETER(GuestCtx);
-    
-    if (Vmcb->ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDPMC) {
-        Vmcb->StateSaveArea.Rflags |= X86_FLAGS_IF;
-        Vmcb->ControlArea.InterceptMisc1 &= ~SVM_INTERCEPT_MISC1_RDPMC;
-    }
-    
-    if (Vmcb->ControlArea.InterceptMisc2 & SVM_INTERCEPT_MISC2_VMMCALL) {
-        UINT64 DebugCtl = __readmsr(IA32_MSR_DEBUGCTL);
-        DebugCtl |= BRANCH_SINGLE_STEP;
-        __writemsr(IA32_MSR_DEBUGCTL, DebugCtl);
-        Vmcb->ControlArea.InterceptMisc2 &= ~SVM_INTERCEPT_MISC2_VMMCALL;
-    }
-    
-    if (Vmcb->ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDTSC) {
-        Vmcb->ControlArea.InterceptMisc1 &= ~SVM_INTERCEPT_MISC1_RDTSC;
-    } else {
-        Vmcb->StateSaveArea.Rflags &= ~X86_FLAGS_TF;
-    }
-    
-    DESCRIPTOR_TABLE_REGISTER Gdtr;
-    _sgdt(&Gdtr);
-    Vmcb->StateSaveArea.GdtrLimit = Gdtr.Limit;
-    
-    SvInjectSs(Vmcb, (UINT32)Vmcb->ControlArea.ExitInfo1);
-}
-
-static VOID SvHandleSgdt(PVMCB Vmcb, PGUEST_CONTEXT GuestCtx) {
-    UNREFERENCED_PARAMETER(GuestCtx);
-    
-    // Set up intercepts for next step
-    if (Vmcb->StateSaveArea.Rflags & X86_FLAGS_TF) {
-        Vmcb->ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_RDTSC;
-    }
-    
-    if (Vmcb->StateSaveArea.Rflags & X86_FLAGS_IF) {
-        Vmcb->ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_RDPMC;
-        Vmcb->StateSaveArea.Rflags &= ~X86_FLAGS_IF;
-    }
-    
-    UINT64 DebugCtl = __readmsr(IA32_MSR_DEBUGCTL);
-    if (DebugCtl & BRANCH_SINGLE_STEP) {
-        Vmcb->ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMMCALL;
-        DebugCtl &= ~BRANCH_SINGLE_STEP;
-        __writemsr(IA32_MSR_DEBUGCTL, DebugCtl);
-    }
-    
-    Vmcb->StateSaveArea.Rflags |= X86_FLAGS_TF;
-    Vmcb->ControlArea.InterceptMisc1 &= ~SVM_INTERCEPT_MISC1_GDTR_READ;
-    Vmcb->ControlArea.InterceptException |= SVM_INTERCEPT_EXCEPTION_PF;
-    Vmcb->ControlArea.InterceptException |= SVM_INTERCEPT_EXCEPTION_AC;
-    Vmcb->ControlArea.InterceptException |= SVM_INTERCEPT_EXCEPTION_SS;
-    
-    // Check if DR3 is set for spoofing
-    UINT64 Dr3 = __readdr(3);
-    UINT64 Dr7 = Vmcb->StateSaveArea.Dr7;
-    if (Vmcb->StateSaveArea.Cpl == 3 && Dr3 == TARGET_DR3 && (Dr7 & 0xF0000040) == 0x40) {
-        Vmcb->StateSaveArea.GdtrLimit = 0x7F;
-    }
-}
-
-// ============================================================================
-//                             VMCB INITIALIZATION
-// ============================================================================
-
-static VOID SvPrepareVirtualization(PVIRTUAL_PROCESSOR_DATA VpData,
-                                     PSHARED_VIRTUAL_PROCESSOR_DATA Shared,
-                                     PCONTEXT Context) {
-    DESCRIPTOR_TABLE_REGISTER Gdtr, Idtr;
-    _sgdt(&Gdtr);
-    __sidt(&Idtr);
-    
-    PHYSICAL_ADDRESS GuestVmcbPa = MmGetPhysicalAddress(&VpData->GuestVmcb);
-    PHYSICAL_ADDRESS HostVmcbPa = MmGetPhysicalAddress(&VpData->HostVmcb);
-    PHYSICAL_ADDRESS HostStatePa = MmGetPhysicalAddress(&VpData->HostStateArea);
-    PHYSICAL_ADDRESS Pml4Pa = MmGetPhysicalAddress(&Shared->Pml4Entries);
-    PHYSICAL_ADDRESS MsrpmPa = MmGetPhysicalAddress(Shared->MsrPermissionsMap);
-    
-    // Configure intercepts
-    VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_CPUID;
-    VpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMRUN;
-    VpData->GuestVmcb.ControlArea.InterceptException |= SVM_INTERCEPT_EXCEPTION_DB;
-    VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_MSR_PROT;
-    VpData->GuestVmcb.ControlArea.MsrpmBasePa = MsrpmPa.QuadPart;
-    
-    VpData->GuestVmcb.ControlArea.GuestAsid = 1;
-    
-    // Nested Page Tables (disabled by default, enable if needed)
-    // VpData->GuestVmcb.ControlArea.NpEnable |= 1;
-    // VpData->GuestVmcb.ControlArea.NCr3 = Pml4Pa.QuadPart;
-    
-    // Guest state
-    VpData->GuestVmcb.StateSaveArea.GdtrBase = Gdtr.Base;
-    VpData->GuestVmcb.StateSaveArea.GdtrLimit = Gdtr.Limit;
-    VpData->GuestVmcb.StateSaveArea.IdtrBase = Idtr.Base;
-    VpData->GuestVmcb.StateSaveArea.IdtrLimit = Idtr.Limit;
-    
-    VpData->GuestVmcb.StateSaveArea.CsSelector = Context->SegCs;
-    VpData->GuestVmcb.StateSaveArea.DsSelector = Context->SegDs;
-    VpData->GuestVmcb.StateSaveArea.EsSelector = Context->SegEs;
-    VpData->GuestVmcb.StateSaveArea.SsSelector = Context->SegSs;
-    
-    VpData->GuestVmcb.StateSaveArea.CsAttrib = SvGetSegmentAccessRight(Context->SegCs, Gdtr.Base);
-    VpData->GuestVmcb.StateSaveArea.DsAttrib = SvGetSegmentAccessRight(Context->SegDs, Gdtr.Base);
-    VpData->GuestVmcb.StateSaveArea.EsAttrib = SvGetSegmentAccessRight(Context->SegEs, Gdtr.Base);
-    VpData->GuestVmcb.StateSaveArea.SsAttrib = SvGetSegmentAccessRight(Context->SegSs, Gdtr.Base);
-    
-    VpData->GuestVmcb.StateSaveArea.Efer = __readmsr(IA32_MSR_EFER);
-    VpData->GuestVmcb.StateSaveArea.Cr0 = __readcr0();
-    VpData->GuestVmcb.StateSaveArea.Cr2 = __readcr2();
-    VpData->GuestVmcb.StateSaveArea.Cr3 = __readcr3();
-    VpData->GuestVmcb.StateSaveArea.Cr4 = __readcr4();
-    VpData->GuestVmcb.StateSaveArea.Rflags = Context->EFlags;
-    VpData->GuestVmcb.StateSaveArea.Rsp = Context->Rsp;
-    VpData->GuestVmcb.StateSaveArea.Rip = Context->Rip;
-    
-    // Save host state to VMCB
-    __svm_vmsave(GuestVmcbPa.QuadPart);
-    
-    // Setup LSTAR hook (will be replaced if tracking active)
-    VpData->GuestVmcb.StateSaveArea.LStar = (UINT64)SystemCallHook;
-    
-    // Setup host stack layout
-    VpData->Layout.Magic = MAXUINT64;
-    VpData->Layout.Shared = Shared;
-    VpData->Layout.Self = VpData;
-    VpData->Layout.HostVmcbPa = HostVmcbPa.QuadPart;
-    VpData->Layout.GuestVmcbPa = GuestVmcbPa.QuadPart;
-    
-    __writemsr(SVM_MSR_VM_HSAVE_PA, HostStatePa.QuadPart);
-    __svm_vmsave(HostVmcbPa.QuadPart);
-}
-
-// ============================================================================
-//                             PROCESSOR VIRTUALIZATION
-// ============================================================================
-
-static NTSTATUS SvVirtualizeProcessor(PVOID Context) {
-    PSHARED_VIRTUAL_PROCESSOR_DATA Shared = (PSHARED_VIRTUAL_PROCESSOR_DATA)Context;
-    CONTEXT HostContext;
-    PVIRTUAL_PROCESSOR_DATA VpData = nullptr;
-    NTSTATUS Status = STATUS_SUCCESS;
-    
-    VpData = (PVIRTUAL_PROCESSOR_DATA)SvAllocatePageAlignedMemory(sizeof(VIRTUAL_PROCESSOR_DATA));
-    if (!VpData) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    
-    if (!SvIsSimpleSvmInstalled()) {
-        RtlCaptureContext(&HostContext);
-        SvPrepareVirtualization(VpData, Shared, &HostContext);
-        
-        __writemsr(IA32_MSR_EFER, __readmsr(IA32_MSR_EFER) | EFER_SVME);
-        
-        // Enter VM loop - never returns normally
-        LaunchVm(&VpData->Layout.GuestVmcbPa);
-        
-        // Should never reach here
-        KeBugCheck(MANUALLY_INITIATED_CRASH);
-    }
-    
-    SvFreePageAlignedMemory(VpData);
-    return Status;
-}
-
-static NTSTATUS SvDevirtualizeProcessor(PVOID Context) {
-    INT Regs[4];
-    UINT64 High, Low;
-    PVIRTUAL_PROCESSOR_DATA VpData = nullptr;
-    PSHARED_VIRTUAL_PROCESSOR_DATA* SharedPtr = (PSHARED_VIRTUAL_PROCESSOR_DATA*)Context;
-    
-    __cpuidex(Regs, CPUID_UNLOAD_SIMPLE_SVM, CPUID_UNLOAD_SIMPLE_SVM);
-    if (Regs[2] == 'SSVM') {
-        High = Regs[3];
-        Low = Regs[0];
-        VpData = (PVIRTUAL_PROCESSOR_DATA)(High << 32 | Low);
-        if (VpData && VpData->Layout.Magic == MAXUINT64 && SharedPtr) {
-            *SharedPtr = VpData->Layout.Shared;
-        }
-        SvFreePageAlignedMemory(VpData);
-    }
-    
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS SvExecuteOnEachProcessor(PFUNCTION Callback, PVOID Context, PULONG Completed) {
-    NTSTATUS Status = STATUS_SUCCESS;
-    ULONG Count = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    ULONG i = 0;
-    
-    for (i = 0; i < Count; i++) {
-        PROCESSOR_NUMBER ProcNum;
-        Status = KeGetProcessorNumberFromIndex(i, &ProcNum);
-        if (!NT_SUCCESS(Status)) goto Exit;
-        
-        GROUP_AFFINITY Affinity = { 0 };
-        Affinity.Group = ProcNum.Group;
-        Affinity.Mask = 1ULL << ProcNum.Number;
-        
-        GROUP_AFFINITY OldAffinity;
-        KeSetSystemGroupAffinityThread(&Affinity, &OldAffinity);
-        
-        Status = Callback(Context);
-        
-        KeRevertToUserGroupAffinityThread(&OldAffinity);
-        if (!NT_SUCCESS(Status)) goto Exit;
-    }
-    
+    GuestContext->VpRegs->Rax = (UINT32)registers[0];
+    GuestContext->VpRegs->Rbx = (UINT32)registers[1];
+    GuestContext->VpRegs->Rcx = (UINT32)registers[2];
+    GuestContext->VpRegs->Rdx = (UINT32)registers[3];
 Exit:
-    if (Completed) *Completed = i;
-    return Status;
-}
-
-static NTSTATUS SvVirtualizeAllProcessors(VOID) {
-    NTSTATUS Status;
-    PSHARED_VIRTUAL_PROCESSOR_DATA Shared = nullptr;
-    ULONG Completed = 0;
-    
-    if (!SvIsSvmSupported()) {
-        return STATUS_HV_FEATURE_UNAVAILABLE;
-    }
-    
-    Shared = (PSHARED_VIRTUAL_PROCESSOR_DATA)SvAllocatePageAlignedMemory(sizeof(SHARED_VIRTUAL_PROCESSOR_DATA));
-    if (!Shared) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    
-    Shared->MsrPermissionsMap = SvAllocateContiguousMemory(SVM_MSR_PERMISSIONS_MAP_SIZE);
-    if (!Shared->MsrPermissionsMap) {
-        SvFreePageAlignedMemory(Shared);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    
-    SvBuildNestedPageTables(Shared);
-    SvBuildMsrPermissionsMap(Shared->MsrPermissionsMap);
-    
-    Status = SvExecuteOnEachProcessor(SvVirtualizeProcessor, Shared, &Completed);
-    
-    if (!NT_SUCCESS(Status) && Completed) {
-        SvDevirtualizeAllProcessors();
-    }
-    
-    return Status;
-}
-
-static VOID SvDevirtualizeAllProcessors(VOID) {
-    PSHARED_VIRTUAL_PROCESSOR_DATA Shared = nullptr;
-    
-    SvExecuteOnEachProcessor(SvDevirtualizeProcessor, &Shared, nullptr);
-    
-    if (Shared) {
-        if (Shared->MsrPermissionsMap) {
-            SvFreeContiguousMemory(Shared->MsrPermissionsMap);
+    VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+    if ((VpData->GuestVmcb.StateSaveArea.Rflags & X86_FLAGS_TF) != 0)
+    {
+        if ((__readmsr(IA32_MSR_DEBUGCTL) & BranchSingleStep) == 0)
+        {
+            VpData->GuestVmcb.StateSaveArea.Dr6 = (VpData->GuestVmcb.StateSaveArea.Dr6 |= SingleStep);
+            SvInjectDbException(VpData);
         }
-        SvFreePageAlignedMemory(Shared);
     }
 }
 
-// ============================================================================
-//                             C ENTRY POINT
-// ============================================================================
-
-EXTERN_C BOOLEAN NTAPI HandleVmExit(PVIRTUAL_PROCESSOR_DATA VpData, PGUEST_REGISTERS GuestRegs) {
-    GUEST_CONTEXT GuestCtx = { GuestRegs, FALSE };
-    KIRQL OldIrql = KeGetCurrentIrql();
-    
-    __svm_vmload(VpData->Layout.HostVmcbPa);
-    
-    if (OldIrql < DISPATCH_LEVEL) KeRaiseIrqlToDpcLevel();
-    
-    VpData->Layout.TrapFrame.Rsp = VpData->GuestVmcb.StateSaveArea.Rsp;
-    VpData->Layout.TrapFrame.Rip = VpData->GuestVmcb.ControlArea.NRip;
-    
-    GuestRegs->Rax = VpData->GuestVmcb.StateSaveArea.Rax;
-    
-    switch (VpData->GuestVmcb.ControlArea.ExitCode) {
-        case VMEXIT_CPUID:        SvHandleCpuid(&VpData->GuestVmcb, &GuestCtx); break;
-        case VMEXIT_MSR:          SvHandleMsrAccess(&VpData->GuestVmcb, &GuestCtx); break;
-        case VMEXIT_GDTR_READ:    SvHandleSgdt(&VpData->GuestVmcb, &GuestCtx); break;
-        case VMEXIT_EXCEPTION_DB: SvHandleExceptionDb(&VpData->GuestVmcb, &GuestCtx); break;
-        case VMEXIT_EXCEPTION_PF: SvHandleExceptionPf(&VpData->GuestVmcb, &GuestCtx); break;
-        case VMEXIT_EXCEPTION_AC: SvHandleExceptionAc(&VpData->GuestVmcb, &GuestCtx); break;
-        case VMEXIT_EXCEPTION_SS: SvHandleExceptionSs(&VpData->GuestVmcb, &GuestCtx); break;
-        case VMEXIT_VMRUN:        SvHandleVmrun(&VpData->GuestVmcb, &GuestCtx); break;
-        default:
-            DbgPrint("[SVM] Unknown VMEXIT: 0x%llX\n", VpData->GuestVmcb.ControlArea.ExitCode);
-            KeBugCheckEx(MANUALLY_INITIATED_CRASH, 0xDEADBEEF, (ULONG_PTR)VpData, 0, 0);
-    }
-    
-    if (OldIrql < DISPATCH_LEVEL) KeLowerIrql(OldIrql);
-    
-    if (GuestCtx.ExitVm) {
-        if (g_OriginalLstar) {
-            VpData->GuestVmcb.StateSaveArea.LStar = g_OriginalLstar;
+static VOID SvHandleMsrAccess(PVIRTUAL_PROCESSOR_DATA VpData, PGUEST_CONTEXT GuestContext)
+{
+    ULARGE_INTEGER value;
+    UINT32 msr = GuestContext->VpRegs->Rcx & 0xFFFFFFFF;
+    BOOLEAN writeAccess = (VpData->GuestVmcb.ControlArea.ExitInfo1 != 0);
+    if (msr == IA32_MSR_EFER)
+    {
+        NT_ASSERT(writeAccess != FALSE);
+        value.LowPart = GuestContext->VpRegs->Rax & 0xFFFFFFFF;
+        value.HighPart = GuestContext->VpRegs->Rdx & 0xFFFFFFFF;
+        if ((value.QuadPart & EFER_SVME) == 0)
+        {
+            SvInjectGeneralProtectionException(VpData);
+            return;
         }
-        
-        GuestRegs->Rax = (UINT64)VpData & 0xFFFFFFFF;
-        GuestRegs->Rbx = VpData->GuestVmcb.ControlArea.NRip;
-        GuestRegs->Rcx = VpData->GuestVmcb.StateSaveArea.Rsp;
-        GuestRegs->Rdx = (UINT64)VpData >> 32;
-        
+        VpData->GuestVmcb.StateSaveArea.Efer = value.QuadPart;
+    }
+    else if (msr == IA32_MSR_LSTAR)
+    {
+        if (writeAccess)
+        {
+            value.LowPart = GuestContext->VpRegs->Rax & 0xFFFFFFFF;
+            value.HighPart = GuestContext->VpRegs->Rdx & 0xFFFFFFFF;
+            if (value.QuadPart != OrigLstar)
+                VpData->GuestVmcb.StateSaveArea.LStar = value.QuadPart;
+            else
+                VpData->GuestVmcb.StateSaveArea.LStar = LstarHook;
+        }
+        else
+        {
+            value.QuadPart = (VpData->GuestVmcb.StateSaveArea.LStar != LstarHook) 
+                ? VpData->GuestVmcb.StateSaveArea.LStar : OrigLstar;
+            GuestContext->VpRegs->Rax = value.LowPart;
+            GuestContext->VpRegs->Rdx = value.HighPart;
+        }
+    }
+    else
+    {
+        if (writeAccess)
+        {
+            value.LowPart = GuestContext->VpRegs->Rax & 0xFFFFFFFF;
+            value.HighPart = GuestContext->VpRegs->Rdx & 0xFFFFFFFF;
+            __writemsr(msr, value.QuadPart);
+        }
+        else
+        {
+            value.QuadPart = __readmsr(msr);
+            GuestContext->VpRegs->Rax = value.LowPart;
+            GuestContext->VpRegs->Rdx = value.HighPart;
+        }
+    }
+    VpData->GuestVmcb.StateSaveArea.Rip = VpData->GuestVmcb.ControlArea.NRip;
+}
+
+static VOID SvHandleVmrun(PVIRTUAL_PROCESSOR_DATA VpData, PGUEST_CONTEXT GuestContext)
+{
+    UNREFERENCED_PARAMETER(GuestContext);
+    SvInjectGeneralProtectionException(VpData);
+}
+
+static VOID SvHandleDbException(PVIRTUAL_PROCESSOR_DATA VpData, PGUEST_CONTEXT GuestContext)
+{
+    UNREFERENCED_PARAMETER(GuestContext);
+    if (VpData->GuestVmcb.StateSaveArea.Rip == LstarHook)
+        VpData->GuestVmcb.StateSaveArea.Rip = OrigLstar;
+    if ((VpData->GuestVmcb.ControlArea.InterceptException & SVM_InterceptException_AC) != 0)
+    {
+        VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_GDTR_READ;
+        VpData->GuestVmcb.ControlArea.InterceptException = (VpData->GuestVmcb.ControlArea.InterceptException & ~SVM_InterceptException_PF);
+        VpData->GuestVmcb.ControlArea.InterceptException = (VpData->GuestVmcb.ControlArea.InterceptException & ~SVM_InterceptException_AC);
+        VpData->GuestVmcb.ControlArea.InterceptException = (VpData->GuestVmcb.ControlArea.InterceptException & ~SVM_InterceptException_SS);
+        DESCRIPTOR_TABLE_REGISTER CorrectGDTR = {0};
+        _sgdt(&CorrectGDTR);
+        VpData->GuestVmcb.StateSaveArea.GdtrLimit = CorrectGDTR.Limit;
+        if ((VpData->GuestVmcb.ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDPMC) != 0)
+        {
+            VpData->GuestVmcb.StateSaveArea.Rflags = (VpData->GuestVmcb.StateSaveArea.Rflags |= X86_FLAGS_IF);
+            VpData->GuestVmcb.ControlArea.InterceptMisc1 = (VpData->GuestVmcb.ControlArea.InterceptMisc1 & ~SVM_INTERCEPT_MISC1_RDPMC);
+        }
+        BOOLEAN IsDbPending = 0x0;
+        if ((VpData->GuestVmcb.ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDTSC) != 0)
+        {
+            IsDbPending = 0x1;
+            VpData->GuestVmcb.ControlArea.InterceptMisc1 = (VpData->GuestVmcb.ControlArea.InterceptMisc1 & ~SVM_INTERCEPT_MISC1_RDTSC);
+        }
+        else
+        {
+            VpData->GuestVmcb.StateSaveArea.Rflags = (VpData->GuestVmcb.StateSaveArea.Rflags & ~X86_FLAGS_TF);
+        }
+        if ((VpData->GuestVmcb.ControlArea.InterceptMisc2 & SVM_INTERCEPT_MISC2_VMMCALL) != 0)
+        {
+            IsDbPending = 0x0;
+            UINT64 MSR_DEBUGCTL = __readmsr(IA32_MSR_DEBUGCTL);
+            MSR_DEBUGCTL = (MSR_DEBUGCTL |= BranchSingleStep);
+            __writemsr(IA32_MSR_DEBUGCTL, MSR_DEBUGCTL);
+            VpData->GuestVmcb.ControlArea.InterceptMisc2 = (VpData->GuestVmcb.ControlArea.InterceptMisc2 & ~SVM_INTERCEPT_MISC2_VMMCALL);
+        }
+        if (!IsDbPending) return;
+    }
+    SvInjectDbException(VpData);
+}
+
+static VOID SvHandleSGDT(PVIRTUAL_PROCESSOR_DATA VpData, PGUEST_CONTEXT GuestContext)
+{
+    UNREFERENCED_PARAMETER(GuestContext);
+    if ((VpData->GuestVmcb.StateSaveArea.Rflags & X86_FLAGS_TF) != 0)
+        VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_RDTSC;
+    if ((VpData->GuestVmcb.StateSaveArea.Rflags & X86_FLAGS_IF) != 0)
+    {
+        VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_RDPMC;
+        VpData->GuestVmcb.StateSaveArea.Rflags = (VpData->GuestVmcb.StateSaveArea.Rflags & ~X86_FLAGS_IF);
+    }
+    UINT64 MSR_DEBUGCTL = __readmsr(IA32_MSR_DEBUGCTL);
+    if ((MSR_DEBUGCTL & BranchSingleStep) != 0)
+    {
+        VpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMMCALL;
+        MSR_DEBUGCTL = (MSR_DEBUGCTL & ~BranchSingleStep);
+        __writemsr(IA32_MSR_DEBUGCTL, MSR_DEBUGCTL);
+    }
+    VpData->GuestVmcb.StateSaveArea.Rflags = (VpData->GuestVmcb.StateSaveArea.Rflags |= X86_FLAGS_TF);
+    VpData->GuestVmcb.ControlArea.InterceptMisc1 = (VpData->GuestVmcb.ControlArea.InterceptMisc1 & ~SVM_INTERCEPT_MISC1_GDTR_READ);
+    VpData->GuestVmcb.ControlArea.InterceptException |= SVM_InterceptException_PF;
+    VpData->GuestVmcb.ControlArea.InterceptException |= SVM_InterceptException_AC;
+    VpData->GuestVmcb.ControlArea.InterceptException |= SVM_InterceptException_SS;
+    UINT64 CurrentDR3 = __readdr(3);
+    UINT64 CurrentDR7 = VpData->GuestVmcb.StateSaveArea.Dr7;
+    if (VpData->GuestVmcb.StateSaveArea.Cpl == 0x3 && CurrentDR3 == TargetDR3 && (CurrentDR7 & 0xF0000040) == 0x40)
+        VpData->GuestVmcb.StateSaveArea.GdtrLimit = 0x7F;
+}
+
+static VOID SvHandlePFException(PVIRTUAL_PROCESSOR_DATA VpData, PGUEST_CONTEXT GuestContext)
+{
+    UNREFERENCED_PARAMETER(GuestContext);
+    if ((VpData->GuestVmcb.ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDPMC) != 0)
+    {
+        VpData->GuestVmcb.StateSaveArea.Rflags = (VpData->GuestVmcb.StateSaveArea.Rflags |= X86_FLAGS_IF);
+        VpData->GuestVmcb.ControlArea.InterceptMisc1 = (VpData->GuestVmcb.ControlArea.InterceptMisc1 & ~SVM_INTERCEPT_MISC1_RDPMC);
+    }
+    if ((VpData->GuestVmcb.ControlArea.InterceptMisc2 & SVM_INTERCEPT_MISC2_VMMCALL) != 0)
+    {
+        UINT64 MSR_DEBUGCTL = __readmsr(IA32_MSR_DEBUGCTL);
+        MSR_DEBUGCTL = (MSR_DEBUGCTL |= BranchSingleStep);
+        __writemsr(IA32_MSR_DEBUGCTL, MSR_DEBUGCTL);
+        VpData->GuestVmcb.ControlArea.InterceptMisc2 = (VpData->GuestVmcb.ControlArea.InterceptMisc2 & ~SVM_INTERCEPT_MISC2_VMMCALL);
+    }
+    if ((VpData->GuestVmcb.ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDTSC) != 0)
+        VpData->GuestVmcb.ControlArea.InterceptMisc1 = (VpData->GuestVmcb.ControlArea.InterceptMisc1 & ~SVM_INTERCEPT_MISC1_RDTSC);
+    else
+        VpData->GuestVmcb.StateSaveArea.Rflags = (VpData->GuestVmcb.StateSaveArea.Rflags & ~X86_FLAGS_TF);
+    DESCRIPTOR_TABLE_REGISTER CorrectGDTR = {0};
+    _sgdt(&CorrectGDTR);
+    VpData->GuestVmcb.StateSaveArea.GdtrLimit = CorrectGDTR.Limit;
+    VpData->GuestVmcb.ControlArea.InterceptException = (VpData->GuestVmcb.ControlArea.InterceptException & ~SVM_InterceptException_PF);
+    VpData->GuestVmcb.ControlArea.InterceptException = (VpData->GuestVmcb.ControlArea.InterceptException & ~SVM_InterceptException_AC);
+    VpData->GuestVmcb.ControlArea.InterceptException = (VpData->GuestVmcb.ControlArea.InterceptException & ~SVM_InterceptException_SS);
+    VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_GDTR_READ;
+    VpData->GuestVmcb.StateSaveArea.Cr2 = VpData->GuestVmcb.ControlArea.ExitInfo2;
+    SvInjectPFException(VpData);
+}
+
+static VOID SvHandleACException(PVIRTUAL_PROCESSOR_DATA VpData, PGUEST_CONTEXT GuestContext)
+{
+    UNREFERENCED_PARAMETER(GuestContext);
+    if ((VpData->GuestVmcb.ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDPMC) != 0)
+    {
+        VpData->GuestVmcb.StateSaveArea.Rflags = (VpData->GuestVmcb.StateSaveArea.Rflags |= X86_FLAGS_IF);
+        VpData->GuestVmcb.ControlArea.InterceptMisc1 = (VpData->GuestVmcb.ControlArea.InterceptMisc1 & ~SVM_INTERCEPT_MISC1_RDPMC);
+    }
+    if ((VpData->GuestVmcb.ControlArea.InterceptMisc2 & SVM_INTERCEPT_MISC2_VMMCALL) != 0)
+    {
+        UINT64 MSR_DEBUGCTL = __readmsr(IA32_MSR_DEBUGCTL);
+        MSR_DEBUGCTL = (MSR_DEBUGCTL |= BranchSingleStep);
+        __writemsr(IA32_MSR_DEBUGCTL, MSR_DEBUGCTL);
+        VpData->GuestVmcb.ControlArea.InterceptMisc2 = (VpData->GuestVmcb.ControlArea.InterceptMisc2 & ~SVM_INTERCEPT_MISC2_VMMCALL);
+    }
+    if ((VpData->GuestVmcb.ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDTSC) != 0)
+        VpData->GuestVmcb.ControlArea.InterceptMisc1 = (VpData->GuestVmcb.ControlArea.InterceptMisc1 & ~SVM_INTERCEPT_MISC1_RDTSC);
+    else
+        VpData->GuestVmcb.StateSaveArea.Rflags = (VpData->GuestVmcb.StateSaveArea.Rflags & ~X86_FLAGS_TF);
+    DESCRIPTOR_TABLE_REGISTER CorrectGDTR = {0};
+    _sgdt(&CorrectGDTR);
+    VpData->GuestVmcb.StateSaveArea.GdtrLimit = CorrectGDTR.Limit;
+    VpData->GuestVmcb.ControlArea.InterceptException = (VpData->GuestVmcb.ControlArea.InterceptException & ~SVM_InterceptException_PF);
+    VpData->GuestVmcb.ControlArea.InterceptException = (VpData->GuestVmcb.ControlArea.InterceptException & ~SVM_InterceptException_AC);
+    VpData->GuestVmcb.ControlArea.InterceptException = (VpData->GuestVmcb.ControlArea.InterceptException & ~SVM_InterceptException_SS);
+    VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_GDTR_READ;
+    SvInjectACException(VpData);
+}
+
+static VOID SvHandleSsException(PVIRTUAL_PROCESSOR_DATA VpData, PGUEST_CONTEXT GuestContext)
+{
+    UNREFERENCED_PARAMETER(GuestContext);
+    if ((VpData->GuestVmcb.ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDPMC) != 0)
+    {
+        VpData->GuestVmcb.StateSaveArea.Rflags = (VpData->GuestVmcb.StateSaveArea.Rflags |= X86_FLAGS_IF);
+        VpData->GuestVmcb.ControlArea.InterceptMisc1 = (VpData->GuestVmcb.ControlArea.InterceptMisc1 & ~SVM_INTERCEPT_MISC1_RDPMC);
+    }
+    if ((VpData->GuestVmcb.ControlArea.InterceptMisc2 & SVM_INTERCEPT_MISC2_VMMCALL) != 0)
+    {
+        UINT64 MSR_DEBUGCTL = __readmsr(IA32_MSR_DEBUGCTL);
+        MSR_DEBUGCTL = (MSR_DEBUGCTL |= BranchSingleStep);
+        __writemsr(IA32_MSR_DEBUGCTL, MSR_DEBUGCTL);
+        VpData->GuestVmcb.ControlArea.InterceptMisc2 = (VpData->GuestVmcb.ControlArea.InterceptMisc2 & ~SVM_INTERCEPT_MISC2_VMMCALL);
+    }
+    if ((VpData->GuestVmcb.ControlArea.InterceptMisc1 & SVM_INTERCEPT_MISC1_RDTSC) != 0)
+        VpData->GuestVmcb.ControlArea.InterceptMisc1 = (VpData->GuestVmcb.ControlArea.InterceptMisc1 & ~SVM_INTERCEPT_MISC1_RDTSC);
+    else
+        VpData->GuestVmcb.StateSaveArea.Rflags = (VpData->GuestVmcb.StateSaveArea.Rflags & ~X86_FLAGS_TF);
+    DESCRIPTOR_TABLE_REGISTER CorrectGDTR = {0};
+    _sgdt(&CorrectGDTR);
+    VpData->GuestVmcb.StateSaveArea.GdtrLimit = CorrectGDTR.Limit;
+    VpData->GuestVmcb.ControlArea.InterceptException = (VpData->GuestVmcb.ControlArea.InterceptException & ~SVM_InterceptException_PF);
+    VpData->GuestVmcb.ControlArea.InterceptException = (VpData->GuestVmcb.ControlArea.InterceptException & ~SVM_InterceptException_AC);
+    VpData->GuestVmcb.ControlArea.InterceptException = (VpData->GuestVmcb.ControlArea.InterceptException & ~SVM_InterceptException_SS);
+    VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_GDTR_READ;
+    SvInjectSsException(VpData);
+}
+
+EXTERN_C BOOLEAN NTAPI SvHandleVmExit(PVIRTUAL_PROCESSOR_DATA VpData, PGUEST_REGISTERS GuestRegisters)
+{
+    GUEST_CONTEXT guestContext;
+    KIRQL oldIrql;
+    guestContext.VpRegs = GuestRegisters;
+    guestContext.ExitVm = FALSE;
+    __svm_vmload(VpData->HostStackLayout.HostVmcbPa);
+    oldIrql = KeGetCurrentIrql();
+    if (oldIrql < DISPATCH_LEVEL) KeRaiseIrqlToDpcLevel();
+    GuestRegisters->Rax = VpData->GuestVmcb.StateSaveArea.Rax;
+    VpData->HostStackLayout.TrapFrame.Rsp = VpData->GuestVmcb.StateSaveArea.Rsp;
+    VpData->HostStackLayout.TrapFrame.Rip = VpData->GuestVmcb.ControlArea.NRip;
+    switch (VpData->GuestVmcb.ControlArea.ExitCode)
+    {
+    case VMEXIT_CPUID:        SvHandleCpuid(VpData, &guestContext); break;
+    case VMEXIT_MSR:          SvHandleMsrAccess(VpData, &guestContext); break;
+    case VMEXIT_GDTR_READ:    SvHandleSGDT(VpData, &guestContext); break;
+    case VMEXIT_EXCEPTION_DB: SvHandleDbException(VpData, &guestContext); break;
+    case VMEXIT_EXCEPTION_PF: SvHandlePFException(VpData, &guestContext); break;
+    case VMEXIT_EXCEPTION_AC: SvHandleACException(VpData, &guestContext); break;
+    case VMEXIT_EXCEPTION_SS: SvHandleSsException(VpData, &guestContext); break;
+    case VMEXIT_VMRUN:        SvHandleVmrun(VpData, &guestContext); break;
+    default:
+        KeBugCheckEx(MANUALLY_INITIATED_CRASH, 0xDEADBEEF, (ULONG_PTR)VpData, 0, 0);
+    }
+    if (oldIrql < DISPATCH_LEVEL) KeLowerIrql(oldIrql);
+    if (guestContext.ExitVm != FALSE)
+    {
+        if (OrigLstar) VpData->GuestVmcb.StateSaveArea.LStar = OrigLstar;
+        guestContext.VpRegs->Rax = (UINT64)VpData & 0xFFFFFFFF;
+        guestContext.VpRegs->Rbx = VpData->GuestVmcb.ControlArea.NRip;
+        guestContext.VpRegs->Rcx = VpData->GuestVmcb.StateSaveArea.Rsp;
+        guestContext.VpRegs->Rdx = (UINT64)VpData >> 32;
         __svm_vmload(MmGetPhysicalAddress(&VpData->GuestVmcb).QuadPart);
         _disable();
         __svm_stgi();
         __writemsr(IA32_MSR_EFER, __readmsr(IA32_MSR_EFER) & ~EFER_SVME);
         __writeeflags(VpData->GuestVmcb.StateSaveArea.Rflags);
-        
         return TRUE;
     }
-    
-    VpData->GuestVmcb.StateSaveArea.Rax = GuestRegs->Rax;
+    VpData->GuestVmcb.StateSaveArea.Rax = guestContext.VpRegs->Rax;
     return FALSE;
 }
 
-// ============================================================================
-//                             POWER CALLBACK
-// ============================================================================
+static UINT16 SvGetSegmentAccessRight(UINT16 SegmentSelector, ULONG_PTR GdtBase)
+{
+    PSEGMENT_DESCRIPTOR descriptor = (PSEGMENT_DESCRIPTOR)(GdtBase + (SegmentSelector & ~RPL_MASK));
+    SEGMENT_ATTRIBUTE attribute;
+    attribute.Fields.Type = descriptor->Fields.Type;
+    attribute.Fields.System = descriptor->Fields.System;
+    attribute.Fields.Dpl = descriptor->Fields.Dpl;
+    attribute.Fields.Present = descriptor->Fields.Present;
+    attribute.Fields.Avl = descriptor->Fields.Avl;
+    attribute.Fields.LongMode = descriptor->Fields.LongMode;
+    attribute.Fields.DefaultBit = descriptor->Fields.DefaultBit;
+    attribute.Fields.Granularity = descriptor->Fields.Granularity;
+    attribute.Fields.Reserved1 = 0;
+    return attribute.AsUInt16;
+}
 
-static VOID SvPowerCallback(PVOID Context, PVOID Arg1, PVOID Arg2) {
-    UNREFERENCED_PARAMETER(Context);
-    
-    if (Arg1 != (PVOID)PO_CB_SYSTEM_STATE_LOCK) return;
-    
-    if (Arg2 != FALSE) {
-        SvVirtualizeAllProcessors();
-    } else {
-        if (ProcessManager::IsTrackingActive()) {
-            ProcessManager::StopTracking();
+static BOOLEAN SvIsSimpleSvmHypervisorInstalled(VOID)
+{
+    int registers[4];
+    char vendorId[13];
+    __cpuid(registers, CPUID_HV_VENDOR_AND_MAX_FUNCTIONS);
+    *(UINT32*)(vendorId + 0) = registers[1];
+    *(UINT32*)(vendorId + 4) = registers[2];
+    *(UINT32*)(vendorId + 8) = registers[3];
+    vendorId[12] = 0;
+    return (strcmp(vendorId, "SimpleSvm   ") == 0);
+}
+
+static VOID SvPrepareForVirtualization(PVIRTUAL_PROCESSOR_DATA VpData, PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData, const CONTEXT* ContextRecord)
+{
+    DESCRIPTOR_TABLE_REGISTER gdtr, idtr;
+    PHYSICAL_ADDRESS guestVmcbPa, hostVmcbPa, hostStateAreaPa, pml4BasePa, msrpmPa;
+    _sgdt(&gdtr);
+    __sidt(&idtr);
+    guestVmcbPa = MmGetPhysicalAddress(&VpData->GuestVmcb);
+    hostVmcbPa = MmGetPhysicalAddress(&VpData->HostVmcb);
+    hostStateAreaPa = MmGetPhysicalAddress(&VpData->HostStateArea);
+    pml4BasePa = MmGetPhysicalAddress(&SharedVpData->Pml4Entries);
+    msrpmPa = MmGetPhysicalAddress(SharedVpData->MsrPermissionsMap);
+    VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_CPUID;
+    VpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMRUN;
+    VpData->GuestVmcb.ControlArea.InterceptException |= SVM_InterceptException_DB;
+    VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_MSR_PROT;
+    VpData->GuestVmcb.ControlArea.MsrpmBasePa = msrpmPa.QuadPart;
+    VpData->GuestVmcb.ControlArea.GuestAsid = 1;
+    VpData->GuestVmcb.StateSaveArea.GdtrBase = gdtr.Base;
+    VpData->GuestVmcb.StateSaveArea.GdtrLimit = gdtr.Limit;
+    VpData->GuestVmcb.StateSaveArea.IdtrBase = idtr.Base;
+    VpData->GuestVmcb.StateSaveArea.IdtrLimit = idtr.Limit;
+    VpData->GuestVmcb.StateSaveArea.CsLimit = GetSegmentLimit(ContextRecord->SegCs);
+    VpData->GuestVmcb.StateSaveArea.DsLimit = GetSegmentLimit(ContextRecord->SegDs);
+    VpData->GuestVmcb.StateSaveArea.EsLimit = GetSegmentLimit(ContextRecord->SegEs);
+    VpData->GuestVmcb.StateSaveArea.SsLimit = GetSegmentLimit(ContextRecord->SegSs);
+    VpData->GuestVmcb.StateSaveArea.CsSelector = ContextRecord->SegCs;
+    VpData->GuestVmcb.StateSaveArea.DsSelector = ContextRecord->SegDs;
+    VpData->GuestVmcb.StateSaveArea.EsSelector = ContextRecord->SegEs;
+    VpData->GuestVmcb.StateSaveArea.SsSelector = ContextRecord->SegSs;
+    VpData->GuestVmcb.StateSaveArea.CsAttrib = SvGetSegmentAccessRight(ContextRecord->SegCs, gdtr.Base);
+    VpData->GuestVmcb.StateSaveArea.DsAttrib = SvGetSegmentAccessRight(ContextRecord->SegDs, gdtr.Base);
+    VpData->GuestVmcb.StateSaveArea.EsAttrib = SvGetSegmentAccessRight(ContextRecord->SegEs, gdtr.Base);
+    VpData->GuestVmcb.StateSaveArea.SsAttrib = SvGetSegmentAccessRight(ContextRecord->SegSs, gdtr.Base);
+    VpData->GuestVmcb.StateSaveArea.Efer = __readmsr(IA32_MSR_EFER);
+    VpData->GuestVmcb.StateSaveArea.Cr0 = __readcr0();
+    VpData->GuestVmcb.StateSaveArea.Cr2 = __readcr2();
+    VpData->GuestVmcb.StateSaveArea.Cr3 = __readcr3();
+    VpData->GuestVmcb.StateSaveArea.Cr4 = __readcr4();
+    VpData->GuestVmcb.StateSaveArea.Rflags = ContextRecord->EFlags;
+    VpData->GuestVmcb.StateSaveArea.Rsp = ContextRecord->Rsp;
+    VpData->GuestVmcb.StateSaveArea.Rip = ContextRecord->Rip;
+    if ((VpData->GuestVmcb.StateSaveArea.Cr4 & UMIP) == 0)
+    {
+        if (gdtr.Limit < 0x7F) VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_GDTR_READ;
+    }
+    __svm_vmsave(guestVmcbPa.QuadPart);
+    VpData->GuestVmcb.StateSaveArea.LStar = LstarHook;
+    VpData->HostStackLayout.Reserved1 = -1ULL;
+    VpData->HostStackLayout.SharedVpData = SharedVpData;
+    VpData->HostStackLayout.Self = VpData;
+    VpData->HostStackLayout.HostVmcbPa = hostVmcbPa.QuadPart;
+    VpData->HostStackLayout.GuestVmcbPa = guestVmcbPa.QuadPart;
+    __writemsr(SVM_MSR_VM_HSAVE_PA, hostStateAreaPa.QuadPart);
+    __svm_vmsave(hostVmcbPa.QuadPart);
+}
+
+static NTSTATUS SvVirtualizeProcessor(PVOID Context)
+{
+    NTSTATUS status;
+    PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData;
+    PVIRTUAL_PROCESSOR_DATA vpData;
+    PCONTEXT contextRecord;
+    vpData = nullptr;
+    contextRecord = (PCONTEXT)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(CONTEXT), 'MVSS');
+    if (contextRecord == nullptr) return STATUS_INSUFFICIENT_RESOURCES;
+    vpData = (PVIRTUAL_PROCESSOR_DATA)SvAllocatePageAlingedPhysicalMemory(sizeof(VIRTUAL_PROCESSOR_DATA));
+    if (vpData == nullptr)
+    {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Exit;
+    }
+    RtlCaptureContext(contextRecord);
+    if (SvIsSimpleSvmHypervisorInstalled() == FALSE)
+    {
+        SvDebugPrint("Attempting to virtualize the processor.\n");
+        sharedVpData = (PSHARED_VIRTUAL_PROCESSOR_DATA)Context;
+        __writemsr(IA32_MSR_EFER, __readmsr(IA32_MSR_EFER) | EFER_SVME);
+        SvPrepareForVirtualization(vpData, sharedVpData, contextRecord);
+        SvLaunchVm(&vpData->HostStackLayout.GuestVmcbPa);
+        KeBugCheck(MANUALLY_INITIATED_CRASH);
+    }
+    SvDebugPrint("The processor has been virtualized.\n");
+    status = STATUS_SUCCESS;
+Exit:
+    if (contextRecord) ExFreePoolWithTag(contextRecord, 'MVSS');
+    if ((!NT_SUCCESS(status)) && (vpData)) SvFreePageAlingedPhysicalMemory(vpData);
+    return status;
+}
+
+static NTSTATUS SvExecuteOnEachProcessor(NTSTATUS(*Callback)(PVOID), PVOID Context, PULONG NumOfProcessorCompleted)
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG i, numOfProcessors = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    for (i = 0; i < numOfProcessors; i++)
+    {
+        PROCESSOR_NUMBER processorNumber;
+        status = KeGetProcessorNumberFromIndex(i, &processorNumber);
+        if (!NT_SUCCESS(status)) goto Exit;
+        GROUP_AFFINITY affinity, oldAffinity;
+        affinity.Group = processorNumber.Group;
+        affinity.Mask = 1ULL << processorNumber.Number;
+        affinity.Reserved[0] = affinity.Reserved[1] = affinity.Reserved[2] = 0;
+        KeSetSystemGroupAffinityThread(&affinity, &oldAffinity);
+        status = Callback(Context);
+        KeRevertToUserGroupAffinityThread(&oldAffinity);
+        if (!NT_SUCCESS(status)) goto Exit;
+    }
+Exit:
+    if (NumOfProcessorCompleted) *NumOfProcessorCompleted = i;
+    return status;
+}
+
+static NTSTATUS SvDevirtualizeProcessor(PVOID Context)
+{
+    int registers[4];
+    UINT64 high, low;
+    PVIRTUAL_PROCESSOR_DATA vpData;
+    PSHARED_VIRTUAL_PROCESSOR_DATA* sharedVpDataPtr;
+    if (!ARGUMENT_PRESENT(Context)) return STATUS_SUCCESS;
+    __cpuidex(registers, CPUID_UNLOAD_SIMPLE_SVM, CPUID_UNLOAD_SIMPLE_SVM);
+    if (registers[2] != 'SSVM') return STATUS_SUCCESS;
+    SvDebugPrint("The processor has been de-virtualized.\n");
+    high = registers[3];
+    low = registers[0] & 0xFFFFFFFF;
+    vpData = (PVIRTUAL_PROCESSOR_DATA)(high << 32 | low);
+    sharedVpDataPtr = (PSHARED_VIRTUAL_PROCESSOR_DATA*)Context;
+    *sharedVpDataPtr = vpData->HostStackLayout.SharedVpData;
+    SvFreePageAlingedPhysicalMemory(vpData);
+    return STATUS_SUCCESS;
+}
+
+static VOID SvDevirtualizeAllProcessors(VOID)
+{
+    PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData = nullptr;
+    SvExecuteOnEachProcessor(SvDevirtualizeProcessor, &sharedVpData, nullptr);
+    if (sharedVpData)
+    {
+        SvFreeContiguousMemory(sharedVpData->MsrPermissionsMap);
+        SvFreePageAlingedPhysicalMemory(sharedVpData);
+    }
+}
+
+static VOID SvBuildMsrPermissionsMap(PVOID MsrPermissionsMap)
+{
+    const UINT32 BITS_PER_MSR = 2;
+    const UINT32 SECOND_MSR_RANGE_BASE = 0xc0000000;
+    const UINT32 SECOND_MSRPM_OFFSET = 0x800 * 8;
+    RTL_BITMAP bitmapHeader;
+    ULONG offsetFrom2ndBase, offset;
+    RtlInitializeBitMap(&bitmapHeader, (PULONG)MsrPermissionsMap, SVM_MSR_PERMISSIONS_MAP_SIZE * 8);
+    RtlClearAllBits(&bitmapHeader);
+    offsetFrom2ndBase = (IA32_MSR_EFER - SECOND_MSR_RANGE_BASE) * BITS_PER_MSR;
+    offset = SECOND_MSRPM_OFFSET + offsetFrom2ndBase;
+    RtlSetBits(&bitmapHeader, offset + 1, 1);
+    offsetFrom2ndBase = (IA32_MSR_LSTAR - SECOND_MSR_RANGE_BASE) * BITS_PER_MSR;
+    offset = SECOND_MSRPM_OFFSET + offsetFrom2ndBase;
+    RtlSetBits(&bitmapHeader, offset, 1);
+    RtlSetBits(&bitmapHeader, offset + 1, 1);
+}
+
+static VOID SvBuildNestedPageTables(PSHARED_VIRTUAL_PROCESSOR_DATA SharedVpData)
+{
+    for (UINT64 pml4Index = 0; pml4Index < 2; pml4Index++)
+    {
+        PPML4_ENTRY_2MB pml4e = &SharedVpData->Pml4Entries[pml4Index];
+        PPML4E_TREE pml4eTree = &SharedVpData->Pml4eTrees[pml4Index];
+        UINT64 pdptBasePa = MmGetPhysicalAddress(&pml4eTree->PdptEntries).QuadPart;
+        pml4e->Fields.PageFrameNumber = pdptBasePa >> PAGE_SHIFT;
+        pml4e->Fields.Valid = 1;
+        pml4e->Fields.Write = 1;
+        pml4e->Fields.User = 1;
+        for (UINT64 pdptIndex = 0; pdptIndex < 512; pdptIndex++)
+        {
+            UINT64 pdBasePa = MmGetPhysicalAddress(&pml4eTree->PdEntries[pdptIndex][0]).QuadPart;
+            pml4eTree->PdptEntries[pdptIndex].Fields.PageFrameNumber = pdBasePa >> PAGE_SHIFT;
+            pml4eTree->PdptEntries[pdptIndex].Fields.Valid = 1;
+            pml4eTree->PdptEntries[pdptIndex].Fields.Write = 1;
+            pml4eTree->PdptEntries[pdptIndex].Fields.User = 1;
+            for (UINT64 pdIndex = 0; pdIndex < 512; pdIndex++)
+            {
+                UINT64 translationPa = (pml4Index * 512 * 512) + (pdptIndex * 512) + pdIndex;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.PageFrameNumber = translationPa;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.Valid = 1;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.Write = 1;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.User = 1;
+                pml4eTree->PdEntries[pdptIndex][pdIndex].Fields.LargePage = 1;
+            }
         }
+    }
+}
+
+static BOOLEAN SvIsSvmSupported(VOID)
+{
+    int registers[4];
+    __cpuid(registers, 0);
+    if ((registers[1] != 'htuA') || (registers[3] != 'itne') || (registers[2] != 'DMAc')) return FALSE;
+    __cpuid(registers, 0x80000001);
+    if ((registers[2] & (1 << 2)) == 0) return FALSE;
+    __cpuid(registers, 0x8000000A);
+    if ((registers[3] & 1) == 0) return FALSE;
+    UINT64 vmcr = __readmsr(SVM_MSR_VM_CR);
+    if ((vmcr & SVM_VM_CR_SVMDIS) != 0) return FALSE;
+    return TRUE;
+}
+
+static NTSTATUS SvVirtualizeAllProcessors(VOID)
+{
+    NTSTATUS status;
+    PSHARED_VIRTUAL_PROCESSOR_DATA sharedVpData = nullptr;
+    ULONG numOfProcessorsCompleted = 0;
+    if (SvIsSvmSupported() == FALSE) return STATUS_HV_FEATURE_UNAVAILABLE;
+    sharedVpData = (PSHARED_VIRTUAL_PROCESSOR_DATA)SvAllocatePageAlingedPhysicalMemory(sizeof(SHARED_VIRTUAL_PROCESSOR_DATA));
+    if (sharedVpData == nullptr) return STATUS_INSUFFICIENT_RESOURCES;
+    sharedVpData->MsrPermissionsMap = SvAllocateContiguousMemory(SVM_MSR_PERMISSIONS_MAP_SIZE);
+    if (sharedVpData->MsrPermissionsMap == nullptr)
+    {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Exit;
+    }
+    SvBuildNestedPageTables(sharedVpData);
+    SvBuildMsrPermissionsMap(sharedVpData->MsrPermissionsMap);
+    if (!OrigLstar) OrigLstar = __readmsr(IA32_MSR_LSTAR);
+    status = SvExecuteOnEachProcessor(SvVirtualizeProcessor, sharedVpData, &numOfProcessorsCompleted);
+Exit:
+    if (!NT_SUCCESS(status))
+    {
+        if (numOfProcessorsCompleted != 0)
+        {
+            SvDevirtualizeAllProcessors();
+        }
+        else
+        {
+            if (sharedVpData)
+            {
+                if (sharedVpData->MsrPermissionsMap) SvFreeContiguousMemory(sharedVpData->MsrPermissionsMap);
+                SvFreePageAlingedPhysicalMemory(sharedVpData);
+            }
+        }
+    }
+    return status;
+}
+
+static VOID SvPowerCallbackRoutine(PVOID CallbackContext, PVOID Argument1, PVOID Argument2)
+{
+    UNREFERENCED_PARAMETER(CallbackContext);
+    if (Argument1 != (PVOID)PO_CB_SYSTEM_STATE_LOCK) return;
+    if (Argument2 != FALSE)
+        SvVirtualizeAllProcessors();
+    else
         SvDevirtualizeAllProcessors();
-    }
 }
 
-// ============================================================================
-//                             DRIVER ENTRY/UNLOAD
-// ============================================================================
-
-static VOID SvDriverUnload(PDRIVER_OBJECT DriverObject) {
+static VOID SvDriverUnload(PDRIVER_OBJECT DriverObject)
+{
     UNREFERENCED_PARAMETER(DriverObject);
-    
-    DbgPrint("[SVM] Unloading driver...\n");
-    
-    if (ProcessManager::IsTrackingActive()) {
-        ProcessManager::StopTracking();
+    if (CounterThreadHandle)
+    {
+        PETHREAD CounterThread = NULL;
+        ObReferenceObjectByHandle(CounterThreadHandle, 0, *PsThreadType, KernelMode, (PVOID*)&CounterThread, NULL);
+        StopCounterThread = TRUE;
+        if (NotifyRoutineActive) ProcessExitCleanup = TRUE;
+        KeWaitForSingleObject(CounterThread, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(CounterThread);
+        ZwClose(CounterThreadHandle);
+        CounterThreadHandle = NULL;
     }
-    
-    if (g_ProcessMgr) {
-        ProcessManager::Shutdown();
-        delete g_ProcessMgr;
-        g_ProcessMgr = nullptr;
-    }
-    
-    if (g_PowerCallbackRegistration) {
-        ExUnregisterCallback(g_PowerCallbackRegistration);
-        g_PowerCallbackRegistration = nullptr;
-    }
-    
+    if (g_PowerCallbackRegistration) ExUnregisterCallback(g_PowerCallbackRegistration);
     SvDevirtualizeAllProcessors();
-    
-    DbgPrint("[SVM] Driver unloaded\n");
 }
 
-EXTERN_C NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+EXTERN_C NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
+{
+    NTSTATUS status;
+    UNICODE_STRING objectName;
+    OBJECT_ATTRIBUTES objectAttributes;
+    PCALLBACK_OBJECT callbackObject;
+    PVOID callbackRegistration = nullptr;
     UNREFERENCED_PARAMETER(RegistryPath);
-    
-    NTSTATUS Status;
-    UNICODE_STRING ObjName;
-    OBJECT_ATTRIBUTES ObjAttr;
-    PCALLBACK_OBJECT CallbackObj = nullptr;
-    
-    DbgPrint("[SVM] Loading driver...\n");
-    
     DriverObject->DriverUnload = SvDriverUnload;
     ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
-    
-    KeInitializeSpinLock(&g_VmcbLock);
-    
-    // Initialize process manager
-    g_ProcessMgr = new ProcessManager();
-    if (!g_ProcessMgr) {
-        return STATUS_INSUFFICIENT_RESOURCES;
+    objectName = RTL_CONSTANT_STRING(L"\\Callback\\PowerState");
+    InitializeObjectAttributes(&objectAttributes, &objectName, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    status = ExCreateCallback(&callbackObject, &objectAttributes, FALSE, TRUE);
+    if (!NT_SUCCESS(status))
+    {
+        SvDebugPrint("Failed to open power state callback object.\n");
+        goto Exit;
     }
-    
-    Status = ProcessManager::Initialize();
-    if (!NT_SUCCESS(Status)) {
-        delete g_ProcessMgr;
-        g_ProcessMgr = nullptr;
-        return Status;
+    callbackRegistration = ExRegisterCallback(callbackObject, SvPowerCallbackRoutine, nullptr);
+    ObDereferenceObject(callbackObject);
+    if (callbackRegistration == nullptr)
+    {
+        SvDebugPrint("Failed to register power state callback.\n");
+        status = STATUS_UNSUCCESSFUL;
+        goto Exit;
     }
-    
-    // Register power callback
-    RtlInitUnicodeString(&ObjName, L"\\Callback\\PowerState");
-    InitializeObjectAttributes(&ObjAttr, &ObjName, OBJ_CASE_INSENSITIVE, NULL, NULL);
-    Status = ExCreateCallback(&CallbackObj, &ObjAttr, FALSE, TRUE);
-    
-    if (NT_SUCCESS(Status) && CallbackObj) {
-        g_PowerCallbackRegistration = ExRegisterCallback(CallbackObj, SvPowerCallback, nullptr);
-        ObDereferenceObject(CallbackObj);
-    }
-    
-    // Virtualize all processors
-    Status = SvVirtualizeAllProcessors();
-    
-    if (!NT_SUCCESS(Status)) {
-        DbgPrint("[SVM] Virtualization failed: 0x%X\n", Status);
-        ProcessManager::Shutdown();
-        delete g_ProcessMgr;
-        g_ProcessMgr = nullptr;
-        if (g_PowerCallbackRegistration) {
-            ExUnregisterCallback(g_PowerCallbackRegistration);
-            g_PowerCallbackRegistration = nullptr;
+    status = SvVirtualizeAllProcessors();
+Exit:
+    if (NT_SUCCESS(status))
+    {
+        NTSTATUS ThreadStatus = PsCreateSystemThread(&CounterThreadHandle, 0, NULL, NULL, NULL, CounterUpdater, NULL);
+        if (NT_SUCCESS(ThreadStatus))
+        {
+            g_PowerCallbackRegistration = callbackRegistration;
         }
-    } else {
-        DbgPrint("[SVM] Virtualization successful\n");
+        else
+        {
+            status = STATUS_HV_FEATURE_UNAVAILABLE;
+            SvDebugPrint("Failed to create CounterUpdater thread.\n");
+            if (callbackRegistration) ExUnregisterCallback(callbackRegistration);
+        }
     }
-    
-    return Status;
+    else
+    {
+        if (callbackRegistration) ExUnregisterCallback(callbackRegistration);
+    }
+    return status;
 }
