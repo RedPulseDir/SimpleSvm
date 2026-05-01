@@ -1,0 +1,45 @@
+# Build outputs
+build/
+Debug/
+Release/
+x64/
+*.sys
+*.pdb
+*.exe
+*.dll
+*.obj
+*.lib
+*.exp
+*.ilk
+*.log
+*.tlog
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.sln.docstates
+*.vcxproj.filters
+*.vcxproj.user
+*.vcxproj.*.user
+
+# Windows specific
+Thumbs.db
+desktop.ini
+*.tmp
+*.temp
+
+# Driver signing
+*.cer
+*.pfx
+*.pvk
+*.spc
+
+# Code analysis
+*.nativecodeanalysis.xml
+*.sarif
+CodeAnalysis/
+
+# Test artifacts
+test/driver/
+test/logs/
