@@ -17,12 +17,18 @@ jobs:
         with:
           arch: x64
           
-      - name: Build
+      - name: Setup WDK Environment
+        run: |
+          echo "INCLUDE=C:\Program Files (x86)\Windows Kits\10\Include\10.0.20348.0\km;C:\Program Files (x86)\Windows Kits\10\Include\10.0.20348.0\shared;C:\Program Files (x86)\Windows Kits\10\Include\10.0.20348.0\um" >> $env:GITHUB_ENV
+          echo "LIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.20348.0\km\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.20348.0\um\x64" >> $env:GITHUB_ENV
+        shell: powershell
+        
+      - name: Build Driver
         run: |
           mkdir build\output build\obj
           ml64.exe /c /Fo build\obj\x64.obj x64.asm
-          cl.exe /nologo /O2 /GS- /c /D_AMD64_ /D_WIN64 /I. /Fo build\obj\SimpleSvm.obj SimpleSvm.cpp
-          link.exe /nologo /out:build\output\SimpleSvm.sys /driver /entry:DriverEntry /subsystem:native build\obj\*.obj ntoskrnl.lib hal.lib
+          cl.exe /nologo /O2 /GS- /c /D_AMD64_ /D_WIN64 /Fo build\obj\SimpleSvm.obj SimpleSvm.cpp
+          link.exe /nologo /out:build\output\SimpleSvm.sys /driver /entry:DriverEntry /subsystem:native build\obj\*.obj
         shell: cmd
         
       - name: Upload
