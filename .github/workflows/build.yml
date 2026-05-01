@@ -1,0 +1,62 @@
+name: Build SimpleSvm Driver
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  SOLUTION_NAME: SimpleSvm
+  CONFIGURATION: Release
+  PLATFORM: x64
+
+jobs:
+  build:
+    name: Build on Windows
+    runs-on: windows-2022
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Visual Studio environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          
+      - name: Install Windows Driver Kit
+        run: |
+          choco install windows-sdk-11-0-winddk -y
+          choco install wdk -y
+        shell: powershell
+        
+      - name: Create build directory
+        run: |
+          mkdir build
+          mkdir build\output
+        shell: cmd
+        
+      - name: Build driver
+        run: |
+          msbuild SimpleSvm\SimpleSvm.vcxproj /p:Configuration=Release /p:Platform=x64 /p:OutDir="%CD%\build\output\" /p:IntDir="%CD%\build\obj\" /t:Build
+        shell: cmd
+        
+      - name: Verify build output
+        run: |
+          if exist build\output\SimpleSvm.sys (
+            echo Build successful
+            dir build\output\
+          ) else (
+            echo Build failed
+            exit /b 1
+          )
+        shell: cmd
+        
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SimpleSvm-Driver
+          path: build\output\
+          retention-days: 30
