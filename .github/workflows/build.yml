@@ -2,155 +2,30 @@ name: Build SimpleSvm Driver
 
 on:
   push:
-    branches: [ main, master, develop ]
-  pull_request:
     branches: [ main, master ]
   workflow_dispatch:
 
-env:
-  SOLUTION_NAME: SimpleSvm
-  CONFIGURATION: Release
-  PLATFORM: x64
-
 jobs:
   build:
-    name: Build on Windows
     runs-on: windows-2022
     
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        
-      - name: Setup Visual Studio environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-          
-      - name: Download WDK Visual Studio Extension
-        run: |
-          mkdir C:\WDKSetup
-          curl -L -o C:\WDKSetup\WDK.vsix https://go.microsoft.com/fwlink/?linkid=2267864
-        shell: powershell
-        
-      - name: Install WDK via VSIX
-        run: |
-          & "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\VSIXInstaller.exe" /quiet /admin C:\WDKSetup\WDK.vsix
-        shell: powershell
-        continue-on-error: true
-        
-      - name: Download WDK MSI alternative
-        run: |
-          curl -L -o C:\WDKSetup\wdksetup.exe https://go.microsoft.com/fwlink/p/?linkid=2267862
-          Start-Process -FilePath C:\WDKSetup\wdksetup.exe -ArgumentList "/quiet /norestart" -Wait
-        shell: powershell
-        continue-on-error: true
-        
-      - name: Set WDK environment variables
-        run: |
-          echo "WDKContentRoot=C:\Program Files\Windows Kits\10" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          echo "WindowsSdkDir=C:\Program Files\Windows Kits\10" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        shell: powershell
-        
-      - name: Create build directory
-        run: |
-          mkdir build
-          mkdir build\output
-        shell: cmd
-        
-      - name: Build driver
-        run: |
-          msbuild SimpleSvm.vcxproj /p:Configuration=Release /p:Platform=x64 /p:OutDir="%CD%\build\output\" /p:IntDir="%CD%\build\obj\" /t:Build
-        shell: cmd
-        continue-on-error: true
-        
-      - name: Try alternate build with WDK paths
-        if: failure()
-        run: |
-          set WDKContentRoot=C:\Program Files\Windows Kits\10
-          set WindowsSdkDir=C:\Program Files\Windows Kits\10
-          msbuild SimpleSvm.vcxproj /p:Configuration=Release /p:Platform=x64 /p:OutDir="%CD%\build\output\" /p:IntDir="%CD%\build\obj\" /p:WDKContentRoot="C:\Program Files\Windows Kits\10" /p:WindowsSdkDir="C:\Program Files\Windows Kits\10" /t:Build
-        shell: cmd
-        
-      - name: Verify build output
-        run: |
-          if exist build\output\SimpleSvm.sys (
-            echo Build successful
-            dir build\output\
-          ) else (
-            echo Build failed - output not found
-            dir build\output\
-            exit /b 0
-          )
-        shell: cmd
-        
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: SimpleSvm-Driver
-          path: build\output\
-          retention-days: 30
-
-  build-vs2025:
-    name: Build on Windows Server 2025
-    runs-on: windows-latest
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        
-      - name: Setup Visual Studio
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-          
-      - name: Install WDK
-        run: |
-          curl -L -o C:\wdksetup.exe https://go.microsoft.com/fwlink/p/?linkid=2267862
-          Start-Process -FilePath C:\wdksetup.exe -ArgumentList "/quiet /norestart /features + /log C:\wdklog.txt" -Wait
-          Get-Content C:\wdklog.txt
-        shell: powershell
-        continue-on-error: true
-        
-      - name: Build driver
-        run: |
-          mkdir build\output
-          msbuild SimpleSvm.vcxproj /p:Configuration=Release /p:Platform=x64 /p:OutDir="%CD%\build\output\" /t:Build
-        shell: cmd
-        continue-on-error: true
-        
-      - name: Upload artifacts
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: SimpleSvm-Driver-VS2025
-          path: build\output\
-          retention-days: 30
-
-  build-msvc-14:
-    name: Build with MSVC 14.4
-    runs-on: windows-2022
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        
+      - uses: actions/checkout@v4
+      
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
           
-      - name: Build without WDK (using built-in headers)
+      - name: Build
         run: |
           mkdir build\output
-          cl.exe /nologo /O2 /GS- /c /D_AMD64_ /D_WIN64 /D_NTOS_ SimpleSvm.cpp /Fobuild\obj\SimpleSvm.obj
-          link.exe /nologo /out:build\output\SimpleSvm.sys /driver /entry:DriverEntry build\obj\SimpleSvm.obj ntoskrnl.lib hal.lib
+          cd SimpleSvm
+          msbuild SimpleSvm.vcxproj /p:Configuration=Release /p:Platform=x64 /p:OutDir=..\build\output\ /p:IntDir=..\build\obj\
         shell: cmd
-        continue-on-error: true
         
-      - name: Upload artifacts
-        if: success()
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: SimpleSvm-Driver-Native
-          path: build\output\
-          retention-days: 30
+          name: SimpleSvm
+          path: build\output\*.sys
