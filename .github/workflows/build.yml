@@ -1,8 +1,8 @@
-name: Build SimpleSvm Driver
+name: Build SimpleSvm
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -17,15 +17,16 @@ jobs:
         with:
           arch: x64
           
-      - name: Build
+      - name: Build Driver
         run: |
-          mkdir build\output
-          cd SimpleSvm
-          msbuild SimpleSvm.vcxproj /p:Configuration=Release /p:Platform=x64 /p:OutDir=..\build\output\ /p:IntDir=..\build\obj\
+          mkdir build\output build\obj
+          ml64.exe /c /Fo build\obj\x64.obj x64.asm
+          cl.exe /nologo /O2 /GS- /c /D_AMD64_ /D_WIN64 /Fo build\obj\SimpleSvm.obj SimpleSvm.cpp
+          link.exe /nologo /out:build\output\SimpleSvm.sys /driver /entry:DriverEntry /subsystem:native build\obj\*.obj ntoskrnl.lib hal.lib
         shell: cmd
         
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: SimpleSvm
+          name: SimpleSvm.sys
           path: build\output\*.sys
