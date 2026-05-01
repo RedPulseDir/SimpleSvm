@@ -1,24 +1,18 @@
 ;
 ; @file       x64.asm
-; @brief      Assembly code for SVM hypervisor
-; @author     Fox (based on Satoshi Tanda)
+; @brief      Full assembly code for SVM hypervisor
 ;
 
 .data
 
-EXTERN g_OriginalLstar: QWORD
-EXTERN g_TargetSysHandler: QWORD
-
-.const
-
-KTRAP_FRAME_SIZE        equ     190h
-MACHINE_FRAME_SIZE      equ     28h
-XMM_SAVE_SIZE           equ     80h
+EXTERN OriginalLstar: QWORD
+EXTERN SyscallHandler: QWORD
+EXTERN TargetDR3: QWORD
 
 .code
 
 ; ============================================================================
-; MACROS
+; PUSHAQ/POPAQ macros
 ; ============================================================================
 
 PUSHAQ macro
@@ -78,39 +72,37 @@ RESTORE_XMM macro
         endm
 
 ; ============================================================================
+; Constants
+; ============================================================================
+
+KTRAP_FRAME_SIZE        equ     190h
+MACHINE_FRAME_SIZE      equ     28h
+XMM_SAVE_SIZE           equ     80h
+
+; ============================================================================
 ; LaunchVm - Enter VM loop
 ; ============================================================================
 ; Parameters:
 ;   RCX = GuestVmcbPa (pointer to VMCB)
 ; ============================================================================
 
-LaunchVm proc frame
+LaunchVm PROC FRAME
         mov     rsp, rcx                ; Switch to host stack
-        
-        ; Stack layout after switch:
-        ; Rsp+0x00: GuestVmcbPa
-        ; Rsp+0x08: HostVmcbPa
-        ; Rsp+0x10: Self
-        ; Rsp+0x18: SharedVpData
-        ; Rsp+0x20: Padding
-        ; Rsp+0x28: Magic (MAXUINT64)
 
 Lvm10:  mov     rax, [rsp]              ; RAX = GuestVmcbPa
         vmload  rax                     ; Load guest state
-        
         vmrun   rax                     ; Enter guest mode
-        
         vmsave  rax                     ; Save guest state after VMEXIT
         
         ; Allocate trap frame for debugging
         .pushframe
         sub     rsp, KTRAP_FRAME_SIZE
-        .allocstack KTRAP_FRAME_SIZE - MACHINE_FRAME_SIZE + 100h
+        .allocstack KTRAP_FRAME_SIZE - MACHINE_FRAME_SIZE
         
         ; Save guest GPRs
         PUSHAQ
         
-        ; Setup parameters for HandleVmExit
+        ; Setup parameters for SvHandleVmExit
         ; RCX = VpData, RDX = GuestRegisters
         mov     rdx, rsp                ; RDX = GuestRegisters
         mov     rcx, [rsp + 8 * 18 + KTRAP_FRAME_SIZE]  ; RCX = VpData
@@ -120,7 +112,7 @@ Lvm10:  mov     rax, [rsp]              ; RAX = GuestVmcbPa
         SAVE_XMM
         .endprolog
         
-        call    HandleVmExit            ; Handle VMEXIT
+        call    SvHandleVmExit          ; Handle VMEXIT
         
         ; Restore XMM registers
         RESTORE_XMM
@@ -142,26 +134,26 @@ Lvm20:  ; Exit virtualization
         mov     ecx, 'SSVM'             ; Magic value
         jmp     rbx
         
-LaunchVm endp
+LaunchVm ENDP
 
 ; ============================================================================
-; SystemCallHook - LSTAR hook for syscall interception
+; SyscallHook - LSTAR hook for syscall interception
 ; ============================================================================
 
-SystemCallHook proc frame
-        
+SyscallHook PROC FRAME
         ; Check DR3 magic for interception
         mov     rax, dr3
-        cmp     rax, 0x7FFE0FF0h       ; TARGET_DR3
+        cmp     rax, qword ptr [TargetDR3]
         jne     go_original
         
+        ; Check DR7 for global/local breakpoint
         mov     rax, dr7
         and     rax, 0F0000040h
         cmp     rax, 40h
         jne     go_original
         
-        ; Check if target syscall handler is set
-        cmp     qword ptr [g_TargetSysHandler], 0
+        ; Check if syscall handler is set
+        cmp     qword ptr [SyscallHandler], 0
         je      go_original
         
         ; Save volatile registers
@@ -176,7 +168,7 @@ SystemCallHook proc frame
         ; Call target handler
         mov     rcx, r10               ; First parameter
         mov     rdx, r11               ; Second parameter
-        call    qword ptr [g_TargetSysHandler]
+        call    qword ptr [SyscallHandler]
         
         ; Restore registers
         mov     r11, [rsp+28h]
@@ -191,88 +183,17 @@ SystemCallHook proc frame
         sysretq
 
 go_original:
-        jmp     qword ptr [g_OriginalLstar]
+        jmp     qword ptr [OriginalLstar]
         
-        .endprolog
-
-SystemCallHook endp
-
-; ============================================================================
-; ReadDr - Read debug register safely
-; ============================================================================
-
-ReadDr proc
-        mov     eax, ecx
-        cmp     eax, 0
-        je      read_dr0
-        cmp     eax, 1
-        je      read_dr1
-        cmp     eax, 2
-        je      read_dr2
-        cmp     eax, 3
-        je      read_dr3
-        cmp     eax, 6
-        je      read_dr6
-        cmp     eax, 7
-        je      read_dr7
-        xor     rax, rax
-        ret
-        
-read_dr0: mov   rax, dr0
-        ret
-read_dr1: mov   rax, dr1
-        ret
-read_dr2: mov   rax, dr2
-        ret
-read_dr3: mov   rax, dr3
-        ret
-read_dr6: mov   rax, dr6
-        ret
-read_dr7: mov   rax, dr7
-        ret
-ReadDr endp
-
-; ============================================================================
-; WriteDr - Write debug register safely
-; ============================================================================
-
-WriteDr proc
-        mov     rax, rdx
-        cmp     ecx, 0
-        je      write_dr0
-        cmp     ecx, 1
-        je      write_dr1
-        cmp     ecx, 2
-        je      write_dr2
-        cmp     ecx, 3
-        je      write_dr3
-        cmp     ecx, 6
-        je      write_dr6
-        cmp     ecx, 7
-        je      write_dr7
-        ret
-        
-write_dr0: mov   dr0, rax
-        ret
-write_dr1: mov   dr1, rax
-        ret
-write_dr2: mov   dr2, rax
-        ret
-write_dr3: mov   dr3, rax
-        ret
-write_dr6: mov   dr6, rax
-        ret
-write_dr7: mov   dr7, rax
-        ret
-WriteDr endp
+SyscallHook ENDP
 
 ; ============================================================================
 ; InvalidatePage - Invalidate TLB entry
 ; ============================================================================
 
-InvalidatePage proc
+InvalidatePage PROC
         invlpg  [rcx]
         ret
-InvalidatePage endp
+InvalidatePage ENDP
 
-end
+END
