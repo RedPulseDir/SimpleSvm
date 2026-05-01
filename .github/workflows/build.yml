@@ -12,25 +12,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Setup MSVC
+      - name: Setup MSVC and WDK
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
           
-      - name: Setup WDK Environment
-        run: |
-          echo "INCLUDE=C:\Program Files (x86)\Windows Kits\10\Include\10.0.20348.0\km;C:\Program Files (x86)\Windows Kits\10\Include\10.0.20348.0\shared;C:\Program Files (x86)\Windows Kits\10\Include\10.0.20348.0\um" >> $env:GITHUB_ENV
-          echo "LIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.20348.0\km\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.20348.0\um\x64" >> $env:GITHUB_ENV
-        shell: powershell
-        
-      - name: Build Driver
+      - name: Build
+        shell: cmd
         run: |
           mkdir build\output build\obj
+          
+          set INCLUDE=C:\Program Files (x86)\Windows Kits\10\Include\10.0.20348.0\km;C:\Program Files (x86)\Windows Kits\10\Include\10.0.20348.0\shared;C:\Program Files (x86)\Windows Kits\10\Include\10.0.20348.0\um;%INCLUDE%
+          set LIB=C:\Program Files (x86)\Windows Kits\10\Lib\10.0.20348.0\km\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.20348.0\um\x64;%LIB%
+          
           ml64.exe /c /Fo build\obj\x64.obj x64.asm
           cl.exe /nologo /O2 /GS- /c /D_AMD64_ /D_WIN64 /Fo build\obj\SimpleSvm.obj SimpleSvm.cpp
           link.exe /nologo /out:build\output\SimpleSvm.sys /driver /entry:DriverEntry /subsystem:native build\obj\*.obj
-        shell: cmd
-        
+          
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
